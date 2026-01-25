@@ -1,0 +1,5 @@
+# Python Exchange Simulator dependencies
+sortedcontainers>=2.4.0
+
+# Testing
+pytest>=7.0.0
