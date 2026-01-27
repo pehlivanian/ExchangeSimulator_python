@@ -167,6 +167,8 @@ def parse_live_order(input_str: str) -> Optional[LiveOrder]:
         return None
 
     user = parts[4].strip()
+    if not user:
+        return None
 
     return LiveOrder(
         order_type=order_type,
@@ -202,6 +204,8 @@ def parse_cancel_order(input_str: str) -> Optional[CancelOrder]:
         return None
 
     user = parts[2].strip()
+    if not user:
+        return None
 
     return CancelOrder(order_id=order_id, user=user)
 

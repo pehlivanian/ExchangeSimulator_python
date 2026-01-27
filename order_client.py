@@ -2,10 +2,9 @@
 """
 Order Client - Sends orders to the exchange and receives responses.
 
-Supports both synchronous (send order, wait for response) and asynchronous
-(stay connected to receive passive fill notifications) modes.
+Runs in async mode to properly handle passive fill notifications.
 
-Mirrors the C++ order_client_example.cpp and order_client_async.cpp implementations.
+Mirrors the C++ order_client_async.cpp implementation.
 """
 
 import argparse
@@ -62,7 +61,8 @@ class OrderClient:
             order: Order string in format "type,size,price,side,user"
 
         Returns:
-            Response string from the exchange
+            Response string from the exchange (may contain multiple lines
+            if async messages were buffered)
         """
         if not self._socket:
             return "ERROR,Not connected"
@@ -73,10 +73,33 @@ class OrderClient:
                 order += '\n'
             self._socket.sendall(order.encode('utf-8'))
 
-            # Receive response
+            # Receive response - first blocking read
             self._socket.settimeout(5.0)
             data = self._socket.recv(4096)
-            return data.decode('utf-8').strip()
+            self._buffer += data.decode('utf-8')
+
+            # Drain any additional buffered data (non-blocking)
+            self._socket.setblocking(False)
+            try:
+                while True:
+                    more_data = self._socket.recv(4096)
+                    if not more_data:
+                        break
+                    self._buffer += more_data.decode('utf-8')
+            except BlockingIOError:
+                pass  # No more data available
+            finally:
+                self._socket.setblocking(True)
+
+            # Extract complete lines from buffer
+            lines = []
+            while '\n' in self._buffer:
+                line, self._buffer = self._buffer.split('\n', 1)
+                line = line.strip()
+                if line:
+                    lines.append(line)
+
+            return '\n'.join(lines) if lines else ""
 
         except socket.timeout:
             return "ERROR,Timeout"
@@ -146,6 +169,34 @@ class OrderClient:
             print(f"Send error: {e}", file=sys.stderr)
             return False
 
+    def send_cancel(self, order_id: int, user: str) -> str:
+        """
+        Send a cancel request for an existing order (synchronous).
+
+        Args:
+            order_id: The order ID to cancel
+            user: The user who placed the order
+
+        Returns:
+            Response string from the exchange
+        """
+        cancel_order = f"cancel,{order_id},{user}"
+        return self.send_order(cancel_order)
+
+    def send_cancel_async(self, order_id: int, user: str) -> bool:
+        """
+        Send a cancel request without waiting for response (async mode).
+
+        Args:
+            order_id: The order ID to cancel
+            user: The user who placed the order
+
+        Returns:
+            True if sent successfully, False otherwise
+        """
+        cancel_order = f"cancel,{order_id},{user}"
+        return self.send_order_async(cancel_order)
+
 
 ORDER_HELP = """
 ============================================================
@@ -183,10 +234,6 @@ def main():
                         help='Exchange host (default: localhost)')
     parser.add_argument('--port', type=int, default=10000,
                         help='Exchange port (default: 10000)')
-    parser.add_argument('--async', dest='async_mode', action='store_true',
-                        help='Stay connected for async messages')
-    parser.add_argument('--stay', type=float, default=0,
-                        help='Stay connected for N seconds after sending orders')
     parser.add_argument('-q', '--quiet', action='store_true',
                         help='Suppress help message in interactive mode')
     parser.add_argument('orders', nargs='*',
@@ -199,47 +246,28 @@ def main():
         sys.exit(1)
 
     try:
-        if args.async_mode or args.stay > 0:
-            # Async mode - start receive thread first
-            client.start_async_receive()
+        # Start async receive thread
+        client.start_async_receive()
 
-            # Send orders
-            for order in args.orders:
-                print(f"Sending: {order}")
-                client.send_order_async(order)
-                time.sleep(0.1)  # Small delay between orders
+        # Send command-line orders
+        for order in args.orders:
+            print(f"Sending: {order}")
+            client.send_order_async(order)
+            time.sleep(0.1)  # Small delay between orders
 
-            if args.stay > 0:
-                print(f"Staying connected for {args.stay} seconds...")
-                time.sleep(args.stay)
-            elif args.async_mode:
-                # Stay connected until interrupted
-                print("Connected. Press Ctrl+C to disconnect.")
-                try:
-                    while True:
-                        time.sleep(1)
-                except KeyboardInterrupt:
-                    pass
-        else:
-            # Synchronous mode
-            for order in args.orders:
-                print(f"Sending: {order}")
-                response = client.send_order(order)
-                # Print each line of the response separately
-                for line in response.split('\n'):
-                    if line.strip():
-                        print(f"Response: {line}")
-
-            # If reading from stdin
-            if not args.orders:
-                if not args.quiet:
-                    print(ORDER_HELP)
-                print("Enter orders (Ctrl+D to quit):")
-                for line in sys.stdin:
-                    line = line.strip()
-                    if line:
-                        response = client.send_order(line)
-                        print(f"Response: {response}")
+        # Interactive mode - read from stdin while receiving
+        if not args.orders:
+            if not args.quiet:
+                print(ORDER_HELP)
+        print("Enter orders (Ctrl+C to quit):")
+        try:
+            for line in sys.stdin:
+                line = line.strip()
+                if line:
+                    print(f"Sending: {line}")
+                    client.send_order_async(line)
+        except KeyboardInterrupt:
+            pass
 
     finally:
         client.disconnect()
