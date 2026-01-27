@@ -85,6 +85,7 @@ class ExchangeServer:
         self._order_remaining_size: Dict[int, int] = {}
         self._order_side: Dict[int, str] = {}  # order_id -> 'B' or 'S'
         self._order_price: Dict[int, int] = {}  # order_id -> price
+        self._order_expiry_time: Dict[int, float] = {}  # order_id -> expiry timestamp
         self._order_remaining_lock = threading.Lock()
 
         # Shutdown coordination
@@ -198,6 +199,9 @@ class ExchangeServer:
 
         while self._running:
             time.sleep(1.0)
+
+            # Check for expired orders every second
+            self._check_expired_orders()
 
             # Log client counts every 30 seconds
             current_time = time.time()
@@ -331,11 +335,12 @@ class ExchangeServer:
         # Record order ownership
         self._state.record_order(order_id, order.user, conn_id)
 
-        # Track remaining size, side, and price for passive fills and cancellation
+        # Track remaining size, side, price, and expiry for passive fills and cancellation
         with self._order_remaining_lock:
             self._order_remaining_size[order_id] = order.size
             self._order_side[order_id] = order.side
             self._order_price[order_id] = order.price
+            self._order_expiry_time[order_id] = time.time() + order.ttl
 
         # Create insert event
         insert_event = create_insert_event(
@@ -380,6 +385,7 @@ class ExchangeServer:
                 self._order_remaining_size.pop(order_id, None)
                 self._order_side.pop(order_id, None)
                 self._order_price.pop(order_id, None)
+                self._order_expiry_time.pop(order_id, None)
                 self._state.remove_order(order_id)
             else:
                 self._order_remaining_size[order_id] = remainder
@@ -443,6 +449,7 @@ class ExchangeServer:
                 self._order_remaining_size.pop(trade.order_id, None)
                 self._order_side.pop(trade.order_id, None)
                 self._order_price.pop(trade.order_id, None)
+                self._order_expiry_time.pop(trade.order_id, None)
                 self._state.remove_order(trade.order_id)
             else:
                 # Partial fill
@@ -509,6 +516,7 @@ class ExchangeServer:
             cancelled_size = self._order_remaining_size.pop(order_id, 0)
             self._order_side.pop(order_id, None)
             self._order_price.pop(order_id, None)
+            self._order_expiry_time.pop(order_id, None)
             self._state.remove_order(order_id)
 
         return OrderHandlerMessage(
@@ -516,6 +524,73 @@ class ExchangeServer:
             order_id=order_id,
             size=cancelled_size
         ).serialize()
+
+    def _check_expired_orders(self) -> None:
+        """Check for and expire any orders past their TTL."""
+        current_time = time.time()
+        expired_orders = []
+
+        with self._order_remaining_lock:
+            for order_id, expiry_time in list(self._order_expiry_time.items()):
+                if current_time >= expiry_time:
+                    expired_orders.append(order_id)
+
+        # Process expirations outside the lock to avoid deadlock
+        for order_id in expired_orders:
+            self._expire_order(order_id)
+
+    def _expire_order(self, order_id: int) -> None:
+        """Expire an order due to TTL."""
+        with self._order_remaining_lock:
+            # Check if order still exists (might have been filled or cancelled)
+            if order_id not in self._order_remaining_size:
+                return
+
+            remaining_size = self._order_remaining_size[order_id]
+            side = self._order_side.get(order_id)
+            price = self._order_price.get(order_id)
+
+            if side is None or price is None:
+                return
+
+            # Create delete event to remove from order book
+            delete_event = create_delete_event(
+                self._state,
+                order_id,
+                price,
+                side
+            )
+
+            # Process the delete
+            ack, _ = self._order_book.process_event(delete_event)
+
+            if not ack.acked:
+                logger.warning(f"Failed to expire order {order_id}: {ack.reason_rejected}")
+                return
+
+            # Remove all tracking
+            expired_size = self._order_remaining_size.pop(order_id, 0)
+            self._order_side.pop(order_id, None)
+            self._order_price.pop(order_id, None)
+            self._order_expiry_time.pop(order_id, None)
+
+            # Get connection ID for sending expiry notification
+            conn_id = self._state.get_connection(order_id)
+            self._state.remove_order(order_id)
+
+        # Send EXPIRED message to client (outside lock)
+        msg = OrderHandlerMessage(
+            msg_type=OrderHandlerMessageType.EXPIRED,
+            order_id=order_id,
+            size=expired_size
+        )
+        if conn_id is not None:
+            self._order_handler.send_async_message(conn_id, msg.serialize())
+        logger.debug(f"Order {order_id} expired, size={expired_size}")
+
+        # Call post-order callback to update console display
+        if self._post_order_callback:
+            self._post_order_callback(f"[TTL EXPIRED] order_id={order_id}", msg.serialize())
 
     def _on_client_disconnect(self, conn_id: int) -> None:
         """Called when a client disconnects."""
@@ -530,12 +605,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Order formats:
-  limit,size,price,side,user    - Limit order (e.g., limit,100,50000000,B,trader1)
-  market,size,0,side,user       - Market order (e.g., market,50,0,S,trader1)
-  cancel,order_id,user          - Cancel order (e.g., cancel,1000,trader1)
+  limit,size,price,side,user[,ttl]  - Limit order with optional TTL in seconds
+                                      (e.g., limit,100,50000000,B,trader1)
+                                      (e.g., limit,100,50000000,B,trader1,60)
+  market,size,0,side,user           - Market order (e.g., market,50,0,S,trader1)
+  cancel,order_id,user              - Cancel order (e.g., cancel,1000,trader1)
 
 Price format: price * 10000 (e.g., $5000.00 = 50000000)
 Side: B=Buy, S=Sell
+TTL: Time-to-live in seconds (default: 3600 = 1 hour)
 """
     )
     parser.add_argument('--order-port', type=int, default=10000,
@@ -567,9 +645,9 @@ Side: B=Buy, S=Sell
         print("=" * 60)
         print()
         print("Supported order types:")
-        print("  limit,size,price,side,user   - Limit order")
-        print("  market,size,0,side,user      - Market order")
-        print("  cancel,order_id,user         - Cancel order")
+        print("  limit,size,price,side,user[,ttl] - Limit order (TTL in seconds, default: 3600)")
+        print("  market,size,0,side,user          - Market order")
+        print("  cancel,order_id,user             - Cancel order")
         print()
         print("Price format: price * 10000 (e.g., $5000.00 = 50000000)")
         print("Side: B=Buy, S=Sell")

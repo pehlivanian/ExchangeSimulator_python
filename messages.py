@@ -26,6 +26,7 @@ class OrderHandlerMessageType(Enum):
     PARTIAL_FILL = "PARTIAL_FILL"
     REJECT = "REJECT"
     CANCEL_ACK = "CANCEL_ACK"
+    EXPIRED = "EXPIRED"
 
 
 @dataclass
@@ -72,6 +73,9 @@ class EventLOBSTER:
     direction: str  # 'B' or 'S'
 
 
+DEFAULT_TTL_SECONDS = 3600  # 1 hour default TTL
+
+
 @dataclass
 class LiveOrder:
     """Order received from a live client."""
@@ -80,6 +84,7 @@ class LiveOrder:
     price: int  # In LOBSTER format
     side: str  # 'B' or 'S'
     user: str
+    ttl: int = DEFAULT_TTL_SECONDS  # Time-to-live in seconds
 
 
 @dataclass
@@ -111,6 +116,8 @@ class OrderHandlerMessage:
             return f"REJECT,{self.reason}"
         elif self.msg_type == OrderHandlerMessageType.CANCEL_ACK:
             return f"CANCEL_ACK,{self.order_id},{self.size}"
+        elif self.msg_type == OrderHandlerMessageType.EXPIRED:
+            return f"EXPIRED,{self.order_id},{self.size}"
         return ""
 
 
@@ -131,15 +138,16 @@ def parse_live_order(input_str: str) -> Optional[LiveOrder]:
     """
     Parse a live order string.
 
-    Format: orderType,size,price,side,user
+    Format: orderType,size,price,side,user[,ttl]
     Example: limit,100,58000000,B,trader1
+    Example: limit,100,58000000,B,trader1,60   (60 second TTL)
     """
     input_str = input_str.strip()
     if not input_str:
         return None
 
     parts = input_str.split(',')
-    if len(parts) != 5:
+    if len(parts) not in (5, 6):
         return None
 
     order_type = parts[0].strip().lower()
@@ -170,12 +178,23 @@ def parse_live_order(input_str: str) -> Optional[LiveOrder]:
     if not user:
         return None
 
+    # Parse optional TTL (default: DEFAULT_TTL_SECONDS)
+    ttl = DEFAULT_TTL_SECONDS
+    if len(parts) == 6:
+        try:
+            ttl = int(parts[5].strip())
+            if ttl <= 0:
+                return None
+        except ValueError:
+            return None
+
     return LiveOrder(
         order_type=order_type,
         size=size,
         price=price,
         side=side,
-        user=user
+        user=user,
+        ttl=ttl
     )
 
 

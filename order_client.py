@@ -204,9 +204,9 @@ ORDER_HELP = """
 ============================================================
 
 LIMIT ORDER - Post a passive order to the book
-  Format:  limit,size,price,side,user
-  Example: limit,100,50000000,B,trader1    (Buy 100 @ $5000.00)
-  Example: limit,50,50500000,S,trader1     (Sell 50 @ $5050.00)
+  Format:  limit,size,price,side,user[,ttl]
+  Example: limit,100,50000000,B,trader1    (Buy 100 @ $5000.00, TTL=1 hour)
+  Example: limit,50,50500000,S,trader1,60  (Sell 50 @ $5050.00, TTL=60 sec)
 
 MARKET ORDER - Execute immediately against the book
   Format:  market,size,0,side,user
@@ -220,6 +220,7 @@ CANCEL ORDER - Cancel a resting order
 ------------------------------------------------------------
 Price format: price * 10000 (e.g., $5000.00 = 50000000)
 Side: B = Buy, S = Sell
+TTL: Time-to-live in seconds (default: 3600 = 1 hour)
 ============================================================
 """
 
