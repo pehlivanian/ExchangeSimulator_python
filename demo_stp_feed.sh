@@ -88,18 +88,18 @@ echo "=== CLIENT 1: Market Maker ==="
 echo "Adding liquidity to both sides of the book..."
 echo ""
 
-$PYTHON order_client.py --port $ORDER_PORT --stay 15 \
-    "limit,50,58000000,S,marketmaker" \
-    "limit,200,57950000,B,marketmaker" \
-    "limit,150,58050000,S,marketmaker" \
-    "limit,150,57900000,B,marketmaker" > /tmp/maker_output.txt 2>&1 &
+# Use order_client_with_fsm.py - pipe orders via stdin, sleep to stay connected for fills
+(echo "limit,50,58000000,S"
+ echo "limit,200,57950000,B"
+ echo "limit,150,58050000,S"
+ echo "limit,150,57900000,B"
+ sleep 15) | $PYTHON order_client_with_fsm.py --port $ORDER_PORT -q > /tmp/maker_output.txt 2>&1 &
 MAKER_PID=$!
 
 sleep 4
 
 echo "Market Maker Orders (posted to book):"
-grep "^Sending:" /tmp/maker_output.txt | sed 's/^Sending: /  Sent:     /'
-grep "^\[ASYNC\] ACK" /tmp/maker_output.txt | sed 's/^\[ASYNC\] /  Received: /'
+grep "Submitted:" /tmp/maker_output.txt | sed 's/^/  /'
 echo ""
 
 # Client 2: Aggressive Trader (crosses the spread)
@@ -107,18 +107,17 @@ echo "=== CLIENT 2: Aggressive Trader ==="
 echo "Taking liquidity with market orders..."
 echo ""
 
-$PYTHON order_client.py --port $ORDER_PORT \
-    "market,75,0,B,trader1" \
-    "market,50,0,S,trader1" \
-    "limit,100,57975000,B,trader1" \
-    "limit,80,58025000,S,trader1" > /tmp/trader_output.txt 2>&1 &
+(echo "market,75,B"
+ echo "market,50,S"
+ echo "limit,100,57975000,B"
+ echo "limit,80,58025000,S"
+ sleep 2) | $PYTHON order_client_with_fsm.py --port $ORDER_PORT -q > /tmp/trader_output.txt 2>&1 &
 TRADER_PID=$!
 
 sleep 3
 
 echo "Aggressive Trader Orders:"
-grep "^Sending:" /tmp/trader_output.txt | sed 's/^Sending: /  Sent:     /'
-grep "^Response:" /tmp/trader_output.txt | sed 's/^Response: /  Received: /'
+grep "Submitted:" /tmp/trader_output.txt | sed 's/^/  /'
 echo ""
 
 # Client 3: Demonstrate order cancellation
@@ -126,9 +125,11 @@ echo "=== CLIENT 3: Cancel Order Demo ==="
 echo "Placing an order, then cancelling it..."
 echo ""
 
-$PYTHON order_client.py --port $ORDER_PORT \
-    "limit,500,57800000,B,canceller" \
-    "cancel,1006,canceller" > /tmp/cancel_output.txt 2>&1
+# Submit order, wait for ACK, then cancel (order_id will be 1009 based on sequence)
+(echo "limit,500,57800000,B"
+ sleep 1
+ echo "cancel,1009"
+ sleep 1) | $PYTHON order_client_with_fsm.py --port $ORDER_PORT -q > /tmp/cancel_output.txt 2>&1
 
 echo "Cancel Demo:"
 grep "^Sending:" /tmp/cancel_output.txt | sed 's/^Sending: /  Sent:     /'
@@ -154,30 +155,27 @@ grep "TRADE" /tmp/stp_output.txt 2>/dev/null || echo "(No trades recorded)"
 echo ""
 
 echo "=== MARKET MAKER FULL TRANSCRIPT ==="
-echo "Orders sent:"
-grep "^Sending:" /tmp/maker_output.txt | sed 's/^Sending: /  /'
+echo "Orders submitted:"
+grep "Submitted:" /tmp/maker_output.txt | sed 's/^/  /'
 echo ""
-echo "Initial responses (synchronous ACKs):"
-grep "^\[ASYNC\] ACK" /tmp/maker_output.txt | sed 's/^\[ASYNC\] /  /'
-echo ""
-echo "Passive fill notifications (asynchronous):"
-grep "^\[ASYNC\] PARTIAL_FILL\|^\[ASYNC\] FILL" /tmp/maker_output.txt | sed 's/^\[ASYNC\] /  /' || echo "  (none)"
+echo "State transitions (ACKs and fills):"
+grep "^\[" /tmp/maker_output.txt | sed 's/^/  /' || echo "  (none)"
 echo ""
 
 echo "=== AGGRESSIVE TRADER FULL TRANSCRIPT ==="
-echo "Orders sent:"
-grep "^Sending:" /tmp/trader_output.txt | sed 's/^Sending: /  /'
+echo "Orders submitted:"
+grep "Submitted:" /tmp/trader_output.txt | sed 's/^/  /'
 echo ""
-echo "Responses received:"
-grep "^Response:" /tmp/trader_output.txt | sed 's/^Response: /  /'
+echo "State transitions:"
+grep "^\[" /tmp/trader_output.txt | sed 's/^/  /' || echo "  (none)"
 echo ""
 
 echo "=== CANCEL ORDER DEMO TRANSCRIPT ==="
-echo "Orders/Cancels sent:"
-grep "^Sending:" /tmp/cancel_output.txt | sed 's/^Sending: /  /'
+echo "Orders submitted:"
+grep "Submitted:" /tmp/cancel_output.txt | sed 's/^/  /'
 echo ""
-echo "Responses received:"
-grep "^Response:" /tmp/cancel_output.txt | sed 's/^Response: /  /'
+echo "State transitions (including cancel):"
+grep "^\[" /tmp/cancel_output.txt | sed 's/^/  /' || echo "  (none)"
 echo ""
 
 # Wait for market maker to finish receiving fills
@@ -191,15 +189,16 @@ echo "Summary:"
 echo "  - Market Maker added liquidity on both sides"
 echo "  - Aggressive Trader crossed the spread"
 echo "  - STP feed broadcast all trades"
-echo "  - Order cancellation demonstrated (cancel,order_id,user)"
+echo "  - Order cancellation demonstrated"
+echo "  - FSM tracks order state transitions"
 echo ""
-echo "Order format:  limit,size,price,side,user"
-echo "               market,size,0,side,user"
-echo "Cancel format: cancel,order_id,user"
+echo "Order format:  limit,size,price,side[,ttl]"
+echo "               market,size,side"
+echo "Cancel format: cancel,order_id"
 echo ""
 echo "To run interactively (4 terminals):"
 echo "  Terminal 1: python3 exchange_server.py --show-book"
-echo "  Terminal 2: python3 order_client.py --async   (Market Maker)"
-echo "  Terminal 3: python3 order_client.py           (Trader)"
+echo "  Terminal 2: python3 order_client_with_fsm.py  (Market Maker)"
+echo "  Terminal 3: python3 order_client_with_fsm.py  (Trader)"
 echo "  Terminal 4: python3 stp_client.py             (Monitor)"
 echo "========================================"
