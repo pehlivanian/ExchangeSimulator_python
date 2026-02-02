@@ -145,6 +145,52 @@ class OrderBookSide:
         self._orders.add(order)
         return True
 
+    def find_order_at_price(self, price: int) -> Optional[Order]:
+        """Find any order at the given price level."""
+        for order in self._orders:
+            if order.price == price:
+                return order
+            # Early exit based on sort order
+            if self.is_bid and order.price < price:
+                break
+            if not self.is_bid and order.price > price:
+                break
+        return None
+
+    def reduce_size_at_price(self, price: int, size: int) -> bool:
+        """
+        Reduce size at a price level, removing orders as needed.
+        Used when we don't have the specific order ID but know the price.
+        Returns True if any size was reduced.
+        """
+        remaining_to_reduce = size
+        orders_to_remove = []
+
+        for order in self._orders:
+            if order.price != price:
+                if self.is_bid and order.price < price:
+                    break
+                if not self.is_bid and order.price > price:
+                    break
+                continue
+
+            if order.size <= remaining_to_reduce:
+                remaining_to_reduce -= order.size
+                orders_to_remove.append(order.order_id)
+            else:
+                # Partial reduction
+                self.update_order_size(order.order_id, order.size - remaining_to_reduce)
+                remaining_to_reduce = 0
+                break
+
+            if remaining_to_reduce == 0:
+                break
+
+        for order_id in orders_to_remove:
+            self.remove(order_id)
+
+        return remaining_to_reduce < size
+
     def __len__(self) -> int:
         return len(self._orders)
 
@@ -163,6 +209,50 @@ class OrderBook:
         self.bids = OrderBookSide(is_bid=True)
         self.asks = OrderBookSide(is_bid=False)
         self._lock = threading.Lock()
+        self._next_seed_id = -1  # Negative IDs for seeded orders
+
+    def seed_from_snapshot(self, bid_price: int, bid_size: int,
+                           ask_price: int, ask_size: int, time: float = 0.0) -> None:
+        """
+        Seed the order book with initial BBO state from a LOBSTER orderbook snapshot.
+
+        This creates synthetic orders to represent the initial market state.
+        Uses negative order IDs to distinguish from real LOBSTER order IDs.
+
+        Args:
+            bid_price: Best bid price (LOBSTER format: price * 10000)
+            bid_size: Size at best bid
+            ask_price: Best ask price
+            ask_size: Size at best ask
+            time: Timestamp for the orders
+        """
+        with self._lock:
+            # Handle LOBSTER's empty level markers
+            if bid_price != -9999999999 and bid_size > 0:
+                bid_order = Order(
+                    seq_num=self._next_seed_id,
+                    side='B',
+                    time=time,
+                    order_id=self._next_seed_id,
+                    price=bid_price,
+                    size=bid_size,
+                    order_type=EventType.INSERT
+                )
+                self.bids.insert(bid_order)
+                self._next_seed_id -= 1
+
+            if ask_price != 9999999999 and ask_size > 0:
+                ask_order = Order(
+                    seq_num=self._next_seed_id,
+                    side='S',
+                    time=time,
+                    order_id=self._next_seed_id,
+                    price=ask_price,
+                    size=ask_size,
+                    order_type=EventType.INSERT
+                )
+                self.asks.insert(ask_order)
+                self._next_seed_id -= 1
 
     def process_event(self, event: EventLOBSTER) -> Tuple[Ack, Optional[List[Trade]]]:
         """
@@ -276,40 +366,56 @@ class OrderBook:
         Process an EXECUTE event - removes liquidity from the book.
 
         The direction in EXECUTE is the side of the standing order being executed.
+        For LOBSTER replay, we execute at the specified price, finding any order there.
         """
         if event.direction == 'B':
             side = self.bids
         else:
             side = self.asks
 
-        # Find the order at BBO (or specific order if order_id is set)
-        bbo = side.get_bbo()
-        if bbo is None:
+        # Try to find the specific order by ID first
+        target_order = None
+        if event.order_id in side._order_map:
+            target_order = side._order_map[event.order_id]
+        else:
+            # Fall back to finding any order at the execution price
+            target_order = side.find_order_at_price(event.price)
+
+        if target_order is None:
+            # No liquidity at this price - this can happen with seeded books
+            # Try to reduce size at the price level anyway
+            if side.reduce_size_at_price(event.price, event.size):
+                return Ack(
+                    seq_num=event.seq_num,
+                    order_id=event.order_id,
+                    acked=True
+                ), None
+
             return Ack(
                 seq_num=event.seq_num,
                 order_id=event.order_id,
                 acked=False,
-                reason_rejected="No liquidity"
+                reason_rejected=f"No liquidity at price {event.price}"
             ), None
 
-        # Execute against the BBO
-        exec_size = min(event.size, bbo.size)
+        # Execute against the found order
+        exec_size = min(event.size, target_order.size)
 
         # Create trade
         trade = Trade(
-            seq_num=bbo.seq_num,
+            seq_num=target_order.seq_num,
             counter_seq_num=event.seq_num,
-            order_id=bbo.order_id,
-            side=bbo.side,
-            price=bbo.price,
+            order_id=target_order.order_id,
+            side=target_order.side,
+            price=target_order.price,
             size=exec_size
         )
 
         # Update or remove the standing order
-        if exec_size >= bbo.size:
-            side.remove(bbo.order_id)
+        if exec_size >= target_order.size:
+            side.remove(target_order.order_id)
         else:
-            side.update_order_size(bbo.order_id, bbo.size - exec_size)
+            side.update_order_size(target_order.order_id, target_order.size - exec_size)
 
         ack = Ack(
             seq_num=event.seq_num,
@@ -320,7 +426,12 @@ class OrderBook:
         return ack, [trade]
 
     def _process_cancel(self, event: EventLOBSTER) -> Tuple[Ack, Optional[List[Trade]]]:
-        """Process a CANCEL event - partial cancellation."""
+        """
+        Process a CANCEL event - partial cancellation.
+
+        For LOBSTER replay, if the specific order ID isn't found,
+        we reduce size at the specified price level.
+        """
         if event.direction == 'B':
             side = self.bids
         else:
@@ -340,6 +451,14 @@ class OrderBook:
                 acked=True
             ), None
         else:
+            # Fall back to reducing size at the price level
+            if side.reduce_size_at_price(event.price, event.size):
+                return Ack(
+                    seq_num=event.seq_num,
+                    order_id=event.order_id,
+                    acked=True
+                ), None
+
             return Ack(
                 seq_num=event.seq_num,
                 order_id=event.order_id,
@@ -348,7 +467,12 @@ class OrderBook:
             ), None
 
     def _process_delete(self, event: EventLOBSTER) -> Tuple[Ack, Optional[List[Trade]]]:
-        """Process a DELETE event - full cancellation."""
+        """
+        Process a DELETE event - full cancellation.
+
+        For LOBSTER replay, if the specific order ID isn't found,
+        we try to remove all size at the specified price level.
+        """
         if event.direction == 'B':
             side = self.bids
         else:
@@ -361,6 +485,16 @@ class OrderBook:
                 acked=True
             ), None
         else:
+            # Fall back to reducing size at the price level
+            # For DELETE, we remove the size that was specified in the event
+            # (LOBSTER DELETE events have size = remaining size of the order)
+            if event.size > 0 and side.reduce_size_at_price(event.price, event.size):
+                return Ack(
+                    seq_num=event.seq_num,
+                    order_id=event.order_id,
+                    acked=True
+                ), None
+
             return Ack(
                 seq_num=event.seq_num,
                 order_id=event.order_id,

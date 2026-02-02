@@ -33,9 +33,12 @@ try:
         create_insert_event,
         create_execute_event,
         create_delete_event,
+        create_cancel_event,
     )
     from .tcp_order_handler import TCPOrderHandler
     from .tcp_feed_server import TCPFeedServer
+    from .lobster_reader import LOBSTERReader, LOBSTER_EVENT_TYPE, format_time, format_price
+    from .udp_market_data import UDPMarketDataServer, MarketDataMessage, get_time_of_day
 except ImportError:
     from messages import (
         CancelOrder,
@@ -52,9 +55,12 @@ except ImportError:
         create_insert_event,
         create_execute_event,
         create_delete_event,
+        create_cancel_event,
     )
     from tcp_order_handler import TCPOrderHandler
     from tcp_feed_server import TCPFeedServer
+    from lobster_reader import LOBSTERReader, LOBSTER_EVENT_TYPE, format_time, format_price
+    from udp_market_data import UDPMarketDataServer, MarketDataMessage, get_time_of_day
 
 # Configure logging
 logging.basicConfig(
@@ -69,9 +75,10 @@ class ExchangeServer:
     Main exchange server coordinating order handling and trade broadcasting.
     """
 
-    def __init__(self, order_port: int, feed_port: int):
+    def __init__(self, order_port: int, feed_port: int, market_data_port: int = 0):
         self.order_port = order_port
         self.feed_port = feed_port
+        self.market_data_port = market_data_port
 
         # Core components
         self._order_book = OrderBook()
@@ -80,6 +87,7 @@ class ExchangeServer:
         # Network components
         self._order_handler: Optional[TCPOrderHandler] = None
         self._feed_server: Optional[TCPFeedServer] = None
+        self._market_data_server: Optional[UDPMarketDataServer] = None
 
         # Order tracking for passive fills and cancellation
         self._order_remaining_size: Dict[int, int] = {}
@@ -165,6 +173,13 @@ class ExchangeServer:
         if not self._feed_server.start():
             return False
 
+        # Start UDP market data server if port specified
+        if self.market_data_port > 0:
+            self._market_data_server = UDPMarketDataServer(self.market_data_port)
+            if not self._market_data_server.start():
+                self._feed_server.stop()
+                return False
+
         # Start the order handler
         self._order_handler = TCPOrderHandler(
             port=self.order_port,
@@ -173,10 +188,13 @@ class ExchangeServer:
         )
         if not self._order_handler.start():
             self._feed_server.stop()
+            if self._market_data_server:
+                self._market_data_server.stop()
             return False
 
         self._running = True
-        logger.info(f"Exchange server started - Orders: {self.order_port}, Feed: {self.feed_port}")
+        md_info = f", MarketData(UDP): {self.market_data_port}" if self.market_data_port > 0 else ""
+        logger.info(f"Exchange server started - Orders: {self.order_port}, Feed: {self.feed_port}{md_info}")
         return True
 
     def stop(self) -> None:
@@ -190,6 +208,10 @@ class ExchangeServer:
         if self._feed_server:
             self._feed_server.stop()
             self._feed_server = None
+
+        if self._market_data_server:
+            self._market_data_server.stop()
+            self._market_data_server = None
 
         logger.info("Exchange server stopped")
 
@@ -331,6 +353,7 @@ class ExchangeServer:
     def _process_limit_order(self, conn_id: int, order: LiveOrder) -> str:
         """Process a limit order."""
         order_id = self._state.get_next_order_id()
+        current_time = get_time_of_day()
 
         # Record order ownership
         self._state.record_order(order_id, order.user, conn_id)
@@ -366,13 +389,23 @@ class ExchangeServer:
                 # Send passive fill notification to standing order owner
                 self._send_passive_fill(standing_trade)
 
-                # Broadcast STP message
+                # Broadcast STP message (trades)
                 stp_msg = STPMessage(
                     size=standing_trade.size,
                     price=standing_trade.price,
                     aggressor_side=order.side
                 )
                 self._feed_server.broadcast(stp_msg.serialize())
+
+                # Broadcast EXECUTE on UDP market data (standing order executed)
+                if self._market_data_server:
+                    self._market_data_server.broadcast_execute(
+                        time=current_time,
+                        order_id=standing_trade.order_id,
+                        size=standing_trade.size,
+                        price=standing_trade.price,
+                        side=standing_trade.side
+                    )
 
                 total_executed += standing_trade.size
                 exec_price = standing_trade.price
@@ -389,6 +422,18 @@ class ExchangeServer:
                 self._state.remove_order(order_id)
             else:
                 self._order_remaining_size[order_id] = remainder
+
+        # Broadcast market data for the new order
+        if self._market_data_server:
+            if remainder > 0:
+                # Order rests in book (INSERT for the resting portion)
+                self._market_data_server.broadcast_insert(
+                    time=current_time,
+                    order_id=order_id,
+                    size=remainder,
+                    price=order.price,
+                    side=order.side
+                )
 
         # Generate response
         if total_executed > 0 and remainder > 0:
@@ -467,6 +512,7 @@ class ExchangeServer:
     def _process_cancel_order(self, conn_id: int, cancel: CancelOrder) -> str:
         """Process a cancel order request."""
         order_id = cancel.order_id
+        current_time = get_time_of_day()
 
         with self._order_remaining_lock:
             # Check if order exists and get its details
@@ -518,6 +564,16 @@ class ExchangeServer:
             self._order_price.pop(order_id, None)
             self._order_expiry_time.pop(order_id, None)
             self._state.remove_order(order_id)
+
+        # Broadcast DELETE on UDP market data
+        if self._market_data_server:
+            self._market_data_server.broadcast_delete(
+                time=current_time,
+                order_id=order_id,
+                size=cancelled_size,
+                price=price,
+                side=side
+            )
 
         return OrderHandlerMessage(
             msg_type=OrderHandlerMessageType.CANCEL_ACK,
@@ -599,12 +655,274 @@ class ExchangeServer:
         logger.debug(f"Client {conn_id} disconnected")
 
 
+class HistoricalReplayServer:
+    """
+    Historical replay server that replays LOBSTER market data.
+
+    Reads messages from LOBSTER files and processes them through the order book,
+    optionally validating against a reference orderbook file.
+    Broadcasts order book updates over UDP in LOBSTER format.
+    """
+
+    def __init__(self, message_file: str, orderbook_file: Optional[str] = None,
+                 market_data_port: int = 0):
+        self.message_file = message_file
+        self.orderbook_file = orderbook_file
+        self.market_data_port = market_data_port
+
+        self._order_book = OrderBook()
+        self._state = OrderGeneratorState(use_real_time=False)
+        self._market_data_server: Optional[UDPMarketDataServer] = None
+
+        # Statistics
+        self._message_count = 0
+        self._trade_count = 0
+        self._validation_errors = 0
+        self._skipped_messages = 0
+
+    def print_book(self, output: TextIO = None, levels: int = 5) -> str:
+        """Print a formatted order book snapshot."""
+        bids, asks = self._order_book.get_snapshot()
+
+        lines = []
+        lines.append("")
+        lines.append("┌─────────────────────────────────────────────────┐")
+        lines.append("│              ORDER BOOK SNAPSHOT                │")
+        lines.append("├─────────────────────────────────────────────────┤")
+        lines.append("│      BIDS (Buy)      │      ASKS (Sell)         │")
+        lines.append("│   Price    │  Size   │   Price    │  Size      │")
+        lines.append("├──────────────────────┼──────────────────────────┤")
+
+        max_rows = max(min(len(bids), levels), min(len(asks), levels))
+
+        for i in range(max_rows):
+            line = "│ "
+
+            # Bid side
+            if i < len(bids):
+                bid_price = bids[i].price / 10000.0
+                bid_size = bids[i].size
+                line += f"{bid_price:9.2f} │ {bid_size:7d} │ "
+            else:
+                line += "          │         │ "
+
+            # Ask side
+            if i < len(asks):
+                ask_price = asks[i].price / 10000.0
+                ask_size = asks[i].size
+                line += f"{ask_price:9.2f} │ {ask_size:7d}    │"
+            else:
+                line += "          │            │"
+
+            lines.append(line)
+
+        lines.append("└─────────────────────────────────────────────────┘")
+
+        result = "\n".join(lines)
+
+        if output is not None:
+            output.write(result + "\n")
+            output.flush()
+            return ""
+        return result
+
+    def validate_orderbook(self, expected_bid_price: int, expected_bid_size: int,
+                          expected_ask_price: int, expected_ask_size: int) -> bool:
+        """
+        Validate the current orderbook state against expected values.
+
+        Returns True if the orderbook matches, False otherwise.
+        """
+        actual_bid_price = self._order_book.get_best_bid_price()
+        actual_bid_size = self._order_book.get_best_bid_size()
+        actual_ask_price = self._order_book.get_best_ask_price()
+        actual_ask_size = self._order_book.get_best_ask_size()
+
+        # Handle None values (empty book side)
+        actual_bid_price = actual_bid_price or 0
+        actual_bid_size = actual_bid_size or 0
+        actual_ask_price = actual_ask_price or 0
+        actual_ask_size = actual_ask_size or 0
+
+        # LOBSTER uses special values for empty levels
+        if expected_bid_price == -9999999999:
+            expected_bid_price = 0
+            expected_bid_size = 0
+        if expected_ask_price == 9999999999:
+            expected_ask_price = 0
+            expected_ask_size = 0
+
+        matches = (
+            actual_bid_price == expected_bid_price and
+            actual_bid_size == expected_bid_size and
+            actual_ask_price == expected_ask_price and
+            actual_ask_size == expected_ask_size
+        )
+
+        return matches
+
+    def run(self, print_every: int = 0, validate: bool = True,
+            max_messages: int = 0, verbose: bool = False,
+            skip_initial: int = 0, wait_subscribers: int = 0,
+            wait_ready: bool = False) -> None:
+        """
+        Run the historical replay.
+
+        Args:
+            print_every: Print orderbook every N messages (0 = never)
+            validate: Validate against reference orderbook if available
+            max_messages: Stop after N messages (0 = process all)
+            verbose: Print each message as it's processed
+            skip_initial: Skip validation for first N messages (book warmup)
+            wait_subscribers: Wait until this many UDP subscribers connect (0 = don't wait)
+            wait_ready: Wait for user to press Enter before starting replay
+        """
+        reader = LOBSTERReader(self.message_file, self.orderbook_file)
+
+        # Start UDP market data server if port specified
+        if self.market_data_port > 0:
+            self._market_data_server = UDPMarketDataServer(self.market_data_port)
+            if not self._market_data_server.start():
+                logger.error("Failed to start UDP market data server")
+                return
+
+        print("=" * 70)
+        print("  HISTORICAL REPLAY MODE")
+        print("=" * 70)
+        print(f"  Message file:   {self.message_file}")
+        if self.orderbook_file:
+            print(f"  Orderbook file: {self.orderbook_file}")
+        if self.market_data_port > 0:
+            print(f"  Market data:    UDP port {self.market_data_port}")
+        print(f"  Print every:    {print_every if print_every > 0 else 'disabled'}")
+        print(f"  Validation:     {'enabled' if validate and self.orderbook_file else 'disabled'}")
+        if skip_initial > 0:
+            print(f"  Skip initial:   {skip_initial} messages (warmup)")
+        if max_messages > 0:
+            print(f"  Max messages:   {max_messages}")
+        print("=" * 70)
+        if validate and self.orderbook_file:
+            print()
+            print("NOTE: LOBSTER data represents updates to an existing order book.")
+            print("      Our simulator starts empty, so early validation errors are expected.")
+            print("      Use --skip-initial N to skip validation during book warmup.")
+        if self.market_data_port > 0:
+            print()
+            print(f"UDP Market Data broadcasting on port {self.market_data_port}")
+            print("Send any UDP packet to subscribe to market data updates.")
+        print()
+
+        try:
+            # Wait for subscribers if requested
+            if self._market_data_server and wait_subscribers > 0:
+                print(f"Waiting for {wait_subscribers} subscriber(s)...")
+                while self._market_data_server.get_subscriber_count() < wait_subscribers:
+                    current = self._market_data_server.get_subscriber_count()
+                    print(f"  {current}/{wait_subscribers} subscribers connected", end='\r')
+                    time.sleep(0.5)
+                print(f"  {wait_subscribers}/{wait_subscribers} subscribers connected")
+                print()
+
+            # Wait for user ready signal if requested
+            if wait_ready:
+                if self._market_data_server:
+                    print(f"Subscribers connected: {self._market_data_server.get_subscriber_count()}")
+                input("Press Enter to start replay...")
+                print()
+
+            self._run_replay(reader, print_every, validate, max_messages, verbose, skip_initial)
+        finally:
+            # Stop UDP server
+            if self._market_data_server:
+                self._market_data_server.stop()
+                self._market_data_server = None
+
+    def _run_replay(self, reader: LOBSTERReader, print_every: int, validate: bool,
+                    max_messages: int, verbose: bool, skip_initial: int) -> None:
+        """Internal replay loop."""
+        for msg, expected_book in reader.read_messages_with_orderbook():
+            self._message_count += 1
+
+            # Check message limit
+            if max_messages > 0 and self._message_count > max_messages:
+                break
+
+            # Skip trading halt messages
+            if msg.is_trading_halt:
+                self._skipped_messages += 1
+                continue
+
+            # Convert to event
+            event = reader.to_event(msg, self._state.get_next_seq_num())
+            if event is None:
+                self._skipped_messages += 1
+                continue
+
+            # Verbose output
+            if verbose:
+                event_names = {1: "INSERT", 2: "CANCEL", 3: "DELETE", 4: "EXECUTE", 5: "HIDDEN"}
+                event_name = event_names.get(msg.event_type, "UNKNOWN")
+                side = "BUY" if msg.direction == 1 else "SELL"
+                print(f"[{self._message_count:7d}] {format_time(msg.time)} {event_name:8s} "
+                      f"id={msg.order_id:12d} size={msg.size:6d} "
+                      f"price={format_price(msg.price):>10s} {side}")
+
+            # Process the event
+            ack, trades = self._order_book.process_event(event)
+
+            if trades:
+                self._trade_count += len(trades)
+
+            # Broadcast on UDP market data (raw LOBSTER format line)
+            if self._market_data_server:
+                lobster_line = f"{msg.time:.9f},{msg.event_type},{msg.order_id},{msg.size},{msg.price},{msg.direction}"
+                self._market_data_server.broadcast_raw(lobster_line)
+
+            # Validate against expected orderbook (skip during warmup period)
+            if validate and expected_book and self.orderbook_file and self._message_count > skip_initial:
+                if not self.validate_orderbook(
+                    expected_book.bid_price, expected_book.bid_size,
+                    expected_book.ask_price, expected_book.ask_size
+                ):
+                    self._validation_errors += 1
+                    if verbose or self._validation_errors <= 10:
+                        actual_bid = self._order_book.get_best_bid_price() or 0
+                        actual_bid_sz = self._order_book.get_best_bid_size() or 0
+                        actual_ask = self._order_book.get_best_ask_price() or 0
+                        actual_ask_sz = self._order_book.get_best_ask_size() or 0
+                        print(f"  VALIDATION ERROR at message {self._message_count}:")
+                        print(f"    Expected: bid={format_price(expected_book.bid_price)}x{expected_book.bid_size} "
+                              f"ask={format_price(expected_book.ask_price)}x{expected_book.ask_size}")
+                        print(f"    Actual:   bid={format_price(actual_bid)}x{actual_bid_sz} "
+                              f"ask={format_price(actual_ask)}x{actual_ask_sz}")
+
+            # Periodic orderbook printing
+            if print_every > 0 and self._message_count % print_every == 0:
+                print(f"\n--- After message {self._message_count} ({format_time(msg.time)}) ---")
+                print(self.print_book())
+
+        # Final summary
+        print()
+        print("=" * 70)
+        print("  REPLAY COMPLETE")
+        print("=" * 70)
+        print(f"  Messages processed: {self._message_count}")
+        print(f"  Messages skipped:   {self._skipped_messages}")
+        print(f"  Trades generated:   {self._trade_count}")
+        if validate and self.orderbook_file:
+            print(f"  Validation errors:  {self._validation_errors}")
+        print()
+        print("Final orderbook state:")
+        print(self.print_book())
+        print("=" * 70)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Exchange Server - A multi-threaded order matching engine',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Order formats:
+Order formats (live mode):
   limit,size,price,side,user[,ttl]  - Limit order with optional TTL in seconds
                                       (e.g., limit,100,50000000,B,trader1)
                                       (e.g., limit,100,50000000,B,trader1,60)
@@ -614,8 +932,22 @@ Order formats:
 Price format: price * 10000 (e.g., $5000.00 = 50000000)
 Side: B=Buy, S=Sell
 TTL: Time-to-live in seconds (default: 3600 = 1 hour)
+
+Historical replay mode:
+  --historical <message_file>       - Replay LOBSTER message file
+  --orderbook <orderbook_file>      - LOBSTER orderbook file for validation
+  --print-every N                   - Print orderbook every N messages
+  --max-messages N                  - Stop after N messages
+  --no-validate                     - Disable orderbook validation
+
+UDP Market Data (default port 10002):
+  --market-data-port PORT           - UDP market data port (0 to disable)
+                                      (LOBSTER format: Time,Type,ID,Size,Price,Dir)
+  --wait-subscribers N              - Wait for N subscribers before starting
+  --wait-ready                      - Wait for Enter key before starting
 """
     )
+    # Live mode options
     parser.add_argument('--order-port', type=int, default=10000,
                         help='Port for order handler (default: 10000)')
     parser.add_argument('--feed-port', type=int, default=10001,
@@ -626,7 +958,52 @@ TTL: Time-to-live in seconds (default: 3600 = 1 hour)
                         help='Print order book after each order (same as -v)')
     parser.add_argument('--book-levels', type=int, default=5,
                         help='Number of book levels to display (default: 5)')
+
+    # Historical replay mode options
+    parser.add_argument('--historical', type=str, metavar='MESSAGE_FILE',
+                        help='Run in historical replay mode with LOBSTER message file')
+    parser.add_argument('--orderbook', type=str, metavar='ORDERBOOK_FILE',
+                        help='LOBSTER orderbook file for validation (optional)')
+    parser.add_argument('--print-every', type=int, default=0, metavar='N',
+                        help='Print orderbook every N messages (0=disabled)')
+    parser.add_argument('--max-messages', type=int, default=0, metavar='N',
+                        help='Stop after N messages (0=process all)')
+    parser.add_argument('--no-validate', action='store_true',
+                        help='Disable orderbook validation')
+    parser.add_argument('--skip-initial', type=int, default=0, metavar='N',
+                        help='Skip validation for first N messages (warmup period)')
+    parser.add_argument('--market-data-port', type=int, default=10002, metavar='PORT',
+                        help='UDP port for market data broadcasting (default: 10002, 0=disabled)')
+    parser.add_argument('--wait-subscribers', type=int, default=0, metavar='N',
+                        help='Wait for N UDP subscribers before starting replay')
+    parser.add_argument('--wait-ready', action='store_true',
+                        help='Wait for user to press Enter before starting replay')
+
     args = parser.parse_args()
+
+    # Historical replay mode
+    if args.historical:
+        try:
+            server = HistoricalReplayServer(
+                message_file=args.historical,
+                orderbook_file=args.orderbook,
+                market_data_port=args.market_data_port
+            )
+            server.run(
+                print_every=args.print_every,
+                validate=not args.no_validate,
+                max_messages=args.max_messages,
+                verbose=args.verbose,
+                skip_initial=args.skip_initial,
+                wait_subscribers=args.wait_subscribers,
+                wait_ready=args.wait_ready
+            )
+        except FileNotFoundError as e:
+            logger.error(str(e))
+            sys.exit(1)
+        except KeyboardInterrupt:
+            print("\nReplay interrupted.")
+        return
 
     # Verbose mode enables both debug logging and order book display
     show_book = args.verbose or args.show_book
@@ -641,6 +1018,8 @@ TTL: Time-to-live in seconds (default: 3600 = 1 hour)
         print("=" * 60)
         print(f"  Order Handler Port: {args.order_port}")
         print(f"  STP Feed Port:      {args.feed_port}")
+        if args.market_data_port > 0:
+            print(f"  Market Data Port:   {args.market_data_port} (UDP)")
         print(f"  Book Levels:        {args.book_levels}")
         print("=" * 60)
         print()
@@ -654,7 +1033,7 @@ TTL: Time-to-live in seconds (default: 3600 = 1 hour)
         print("=" * 60)
         print()
 
-    server = ExchangeServer(args.order_port, args.feed_port)
+    server = ExchangeServer(args.order_port, args.feed_port, args.market_data_port)
 
     # Set up post-order callback to print order book
     if show_book:
