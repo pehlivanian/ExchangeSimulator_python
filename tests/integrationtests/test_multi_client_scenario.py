@@ -2,11 +2,12 @@
 """
 Multi-client scenario integration tests.
 
-Simulates realistic trading scenarios with multiple clients interacting,
-verifying that all components work together correctly:
-- Order clients receive their own fills
-- STP broadcasts all trades to all subscribers
-- UDP market data broadcasts all order book changes
+Uses the ACTUAL client components:
+- OrderClientWithFSM from order_client_with_fsm.py
+- STPClient from stp_client.py
+- BookBuilder from udp_book_builder.py
+
+Simulates realistic trading scenarios with multiple clients interacting.
 """
 
 import socket
@@ -14,143 +15,40 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Set
+from typing import List, Optional
 
+# Add parent directory to path for imports
+sys.path.insert(0, '../..')
 
-class OrderClient:
-    """A test order client that tracks its orders and fills."""
-
-    def __init__(self, name: str):
-        self.name = name
-        self.sock: Optional[socket.socket] = None
-        self.orders: Dict[int, dict] = {}  # order_id -> order info
-        self.fills: List[str] = []
-        self._async_sock: Optional[socket.socket] = None
-        self._running = False
-        self._listener_thread: Optional[threading.Thread] = None
-        self._lock = threading.Lock()
-
-    def connect(self, port: int = 10000) -> bool:
-        try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(5.0)
-            self.sock.connect(('127.0.0.1', port))
-            self._running = True
-            self._listener_thread = threading.Thread(target=self._listen_for_async, daemon=True)
-            self._listener_thread.start()
-            return True
-        except Exception as e:
-            print(f"  {self.name}: Connection failed: {e}")
-            return False
-
-    def _listen_for_async(self):
-        """Listen for async notifications (passive fills, expiry)."""
-        while self._running:
-            try:
-                # Use select to check if data available without blocking send_order
-                import select
-                ready, _, _ = select.select([self.sock], [], [], 0.1)
-                if ready and self._running:
-                    with self._lock:
-                        self.sock.setblocking(False)
-                        try:
-                            data = self.sock.recv(4096, socket.MSG_PEEK)
-                            if data:
-                                # Check if this looks like an async message
-                                preview = data.decode()
-                                if any(x in preview for x in ['FILL', 'PARTIAL_FILL', 'EXPIRED']):
-                                    # Actually read it
-                                    data = self.sock.recv(4096)
-                                    for line in data.decode().strip().split('\n'):
-                                        if line:
-                                            self.fills.append(line)
-                        except BlockingIOError:
-                            pass
-                        finally:
-                            self.sock.setblocking(True)
-                            self.sock.settimeout(5.0)
-            except Exception:
-                if self._running:
-                    time.sleep(0.05)
-
-    def send_order(self, order: str) -> str:
-        if not self.sock:
-            return "ERROR: Not connected"
-        try:
-            with self._lock:
-                self.sock.setblocking(True)
-                self.sock.settimeout(5.0)
-                self.sock.sendall((order + '\n').encode())
-                response = self.sock.recv(4096).decode().strip()
-
-            # Track the order if ACKed
-            if response.startswith('ACK'):
-                parts = response.split(',')
-                order_id = int(parts[1])
-                self.orders[order_id] = {'order': order, 'response': response}
-            elif 'FILL' in response:
-                self.fills.append(response)
-
-            return response
-        except Exception as e:
-            return f"ERROR: {e}"
-
-    def close(self):
-        self._running = False
-        if self._listener_thread:
-            self._listener_thread.join(timeout=1.0)
-        if self.sock:
-            self.sock.close()
-            self.sock = None
+from order_client_with_fsm import OrderClientWithFSM, ManagedOrder
+from stp_client import STPClient
+from udp_book_builder import BookBuilder
 
 
 class STPCollector:
-    """Collects all STP trade broadcasts."""
+    """Wrapper around STPClient that collects trades in a list."""
 
-    def __init__(self, port: int = 10001):
-        self.port = port
-        self.sock: Optional[socket.socket] = None
+    def __init__(self, host: str = 'localhost', port: int = 10001):
+        self.client = STPClient(host, port)
         self.trades: List[str] = []
-        self._running = False
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
 
     def start(self) -> bool:
-        try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(1.0)
-            self.sock.connect(('127.0.0.1', self.port))
-            self._running = True
-            self._thread = threading.Thread(target=self._listen, daemon=True)
-            self._thread.start()
-            return True
-        except Exception as e:
-            print(f"  STP collector failed: {e}")
+        if not self.client.connect():
             return False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return True
 
-    def _listen(self):
-        buffer = ""
-        while self._running:
-            try:
-                data = self.sock.recv(1024).decode()
-                if not data:
-                    break
-                buffer += data
-                while '\n' in buffer:
-                    line, buffer = buffer.split('\n', 1)
-                    if line.strip():
-                        with self._lock:
-                            self.trades.append(line.strip())
-            except socket.timeout:
-                continue
-            except Exception:
-                break
+    def _run(self):
+        def callback(msg: str):
+            with self._lock:
+                self.trades.append(msg)
+        self.client.run(callback)
 
     def stop(self):
-        self._running = False
-        if self.sock:
-            self.sock.close()
+        self.client.disconnect()
         if self._thread:
             self._thread.join(timeout=2.0)
 
@@ -158,55 +56,45 @@ class STPCollector:
         with self._lock:
             return list(self.trades)
 
+    def clear(self):
+        with self._lock:
+            self.trades.clear()
 
-class MarketDataCollector:
-    """Collects all UDP market data broadcasts."""
+
+class UDPBookCollector:
+    """Collects UDP market data and builds order book using BookBuilder."""
 
     def __init__(self, port: int = 10002):
         self.port = port
-        self.sock: Optional[socket.socket] = None
+        self.builder = BookBuilder()
         self.messages: List[str] = []
-        self.inserts: List[str] = []
-        self.executes: List[str] = []
-        self.deletes: List[str] = []
-        self.cancels: List[str] = []
-        self._running = False
+        self._sock: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
+        self._running = False
         self._lock = threading.Lock()
 
     def start(self) -> bool:
         try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.sock.settimeout(1.0)
-            self.sock.sendto(b"subscribe", ('127.0.0.1', self.port))
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.settimeout(1.0)
+            self._sock.sendto(b"subscribe", ('127.0.0.1', self.port))
             self._running = True
-            self._thread = threading.Thread(target=self._listen, daemon=True)
+            self._thread = threading.Thread(target=self._run, daemon=True)
             self._thread.start()
             return True
         except Exception as e:
-            print(f"  Market data collector failed: {e}")
+            print(f"UDP collector failed: {e}")
             return False
 
-    def _listen(self):
+    def _run(self):
         while self._running:
             try:
-                data, addr = self.sock.recvfrom(1024)
+                data, addr = self._sock.recvfrom(1024)
                 msg = data.decode().strip()
                 if msg:
                     with self._lock:
                         self.messages.append(msg)
-                        # Parse message type (field index 1)
-                        parts = msg.split(',')
-                        if len(parts) >= 2:
-                            msg_type = parts[1]
-                            if msg_type == '1':
-                                self.inserts.append(msg)
-                            elif msg_type == '2':
-                                self.cancels.append(msg)
-                            elif msg_type == '3':
-                                self.deletes.append(msg)
-                            elif msg_type == '4':
-                                self.executes.append(msg)
+                        self.builder.process_message(msg)
             except socket.timeout:
                 continue
             except Exception:
@@ -214,27 +102,41 @@ class MarketDataCollector:
 
     def stop(self):
         self._running = False
-        if self.sock:
-            self.sock.close()
+        if self._sock:
+            self._sock.close()
         if self._thread:
             self._thread.join(timeout=2.0)
 
+    def get_messages(self) -> List[str]:
+        with self._lock:
+            return list(self.messages)
+
     def get_summary(self) -> dict:
         with self._lock:
+            inserts = sum(1 for m in self.messages if ',1,' in m)
+            cancels = sum(1 for m in self.messages if ',2,' in m)
+            deletes = sum(1 for m in self.messages if ',3,' in m)
+            executes = sum(1 for m in self.messages if ',4,' in m)
             return {
                 'total': len(self.messages),
-                'inserts': len(self.inserts),
-                'cancels': len(self.cancels),
-                'deletes': len(self.deletes),
-                'executes': len(self.executes),
+                'inserts': inserts,
+                'cancels': cancels,
+                'deletes': deletes,
+                'executes': executes,
             }
+
+    def clear(self):
+        with self._lock:
+            self.messages.clear()
+            self.builder = BookBuilder()
 
 
 def start_server() -> subprocess.Popen:
     proc = subprocess.Popen(
         [sys.executable, 'exchange_server.py'],
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
+        stderr=subprocess.PIPE,
+        cwd='../..'
     )
     time.sleep(1.0)
     return proc
@@ -250,7 +152,7 @@ def stop_server(proc: subprocess.Popen):
 
 class ScenarioResults:
     def __init__(self):
-        self.checks: List[tuple] = []  # (name, passed, details)
+        self.checks: List[tuple] = []
 
     def check(self, name: str, condition: bool, details: str = ""):
         self.checks.append((name, condition, details))
@@ -266,12 +168,6 @@ class ScenarioResults:
 def scenario_two_traders_crossing(results: ScenarioResults):
     """
     Scenario: Two traders, Alice and Bob, trade with each other.
-
-    1. Alice places a bid
-    2. Bob places an ask that crosses Alice's bid
-    3. Verify both get fill notifications
-    4. Verify STP broadcasts the trade
-    5. Verify market data shows INSERT then EXECUTE
     """
     print("\n" + "=" * 70)
     print("SCENARIO: Two Traders Crossing")
@@ -279,44 +175,47 @@ def scenario_two_traders_crossing(results: ScenarioResults):
 
     server = start_server()
     stp = STPCollector()
-    mkt = MarketDataCollector()
+    mkt = UDPBookCollector()
 
     try:
         stp.start()
         mkt.start()
         time.sleep(0.3)
 
-        alice = OrderClient(name="Alice")
-        bob = OrderClient(name="Bob")
-
+        # Alice connects and places bid
+        alice = OrderClientWithFSM('localhost', 10000)
         alice.connect()
+        alice.start_async_receive()
+
+        # Bob connects
+        bob = OrderClientWithFSM('localhost', 10000)
         bob.connect()
-        time.sleep(0.2)
+        bob.start_async_receive()
 
         print("\n  Step 1: Alice places bid 100 shares @ $50")
-        alice_response = alice.send_order("limit,100,500000,B,alice")
-        print(f"    Alice response: {alice_response}")
-        results.check("Alice bid ACKed", alice_response.startswith("ACK"))
+        alice_order = alice.create_order("limit", 100, 500000, "B", 3600)
+        alice.submit_order_sync(alice_order)
+        print(f"    Alice order state: {alice_order.state_name}")
+        results.check("Alice bid accepted", alice_order.state_name == "ACCEPTED")
 
         time.sleep(0.2)
 
         print("\n  Step 2: Bob places ask 100 shares @ $50 (crosses)")
-        bob_response = bob.send_order("limit,100,500000,S,bob")
-        print(f"    Bob response: {bob_response}")
-        results.check("Bob ask filled", "FILL" in bob_response)
+        bob_order = bob.create_order("limit", 100, 500000, "S", 3600)
+        bob.submit_order_sync(bob_order)
+        print(f"    Bob order state: {bob_order.state_name}")
+        results.check("Bob ask filled", bob_order.state_name == "FILLED")
 
         time.sleep(0.5)
 
-        print("\n  Step 3: Verify Alice got passive fill notification")
-        print(f"    Alice fills: {alice.fills}")
-        results.check("Alice received fill notification",
-                      any("FILL" in f for f in alice.fills),
-                      f"Fills: {alice.fills}")
+        print("\n  Step 3: Verify Alice got fill (passive fill notification)")
+        print(f"    Alice order state: {alice_order.state_name}")
+        results.check("Alice received fill", alice_order.state_name == "FILLED")
 
         print("\n  Step 4: Verify STP broadcast")
         trades = stp.get_trades()
         print(f"    STP trades: {trades}")
-        results.check("STP broadcast trade", len(trades) >= 1, f"Count: {len(trades)}")
+        results.check("STP broadcast trade", len(trades) >= 1)
 
         print("\n  Step 5: Verify market data")
         md_summary = mkt.get_summary()
@@ -324,8 +223,8 @@ def scenario_two_traders_crossing(results: ScenarioResults):
         results.check("Market data INSERT broadcast", md_summary['inserts'] >= 1)
         results.check("Market data EXECUTE broadcast", md_summary['executes'] >= 1)
 
-        alice.close()
-        bob.close()
+        alice.disconnect()
+        bob.disconnect()
 
     finally:
         stp.stop()
@@ -336,13 +235,6 @@ def scenario_two_traders_crossing(results: ScenarioResults):
 def scenario_market_maker_and_takers(results: ScenarioResults):
     """
     Scenario: One market maker provides liquidity, two takers hit it.
-
-    1. MM places bids and asks at multiple levels
-    2. Taker1 buys (hits asks)
-    3. Taker2 sells (hits bids)
-    4. Verify all trades on STP
-    5. Verify each participant gets correct fills
-    6. Verify market data shows all activity
     """
     print("\n" + "=" * 70)
     print("SCENARIO: Market Maker with Multiple Takers")
@@ -350,70 +242,78 @@ def scenario_market_maker_and_takers(results: ScenarioResults):
 
     server = start_server()
     stp = STPCollector()
-    mkt = MarketDataCollector()
+    mkt = UDPBookCollector()
 
     try:
         stp.start()
         mkt.start()
         time.sleep(0.3)
 
-        mm = OrderClient(name="MarketMaker")
-        taker1 = OrderClient(name="Taker1")
-        taker2 = OrderClient(name="Taker2")
-
+        # Market maker
+        mm = OrderClientWithFSM('localhost', 10000)
         mm.connect()
+        mm.start_async_receive()
+
+        # Takers
+        taker1 = OrderClientWithFSM('localhost', 10000)
         taker1.connect()
+        taker1.start_async_receive()
+
+        taker2 = OrderClientWithFSM('localhost', 10000)
         taker2.connect()
-        time.sleep(0.2)
+        taker2.start_async_receive()
 
         print("\n  Step 1: Market Maker places quotes")
-        # Bids
-        mm.send_order("limit,100,490000,B,mm")  # $49.00
-        mm.send_order("limit,100,495000,B,mm")  # $49.50
-        # Asks
-        mm.send_order("limit,100,505000,S,mm")  # $50.50
-        mm.send_order("limit,100,510000,S,mm")  # $51.00
-        print(f"    MM placed {len(mm.orders)} orders")
-        results.check("MM orders placed", len(mm.orders) == 4, f"Count: {len(mm.orders)}")
+        mm_orders = []
+        mm_orders.append(mm.create_order("limit", 100, 490000, "B", 3600))  # Bid $49
+        mm_orders.append(mm.create_order("limit", 100, 495000, "B", 3600))  # Bid $49.50
+        mm_orders.append(mm.create_order("limit", 100, 505000, "S", 3600))  # Ask $50.50
+        mm_orders.append(mm.create_order("limit", 100, 510000, "S", 3600))  # Ask $51
+
+        for order in mm_orders:
+            mm.submit_order_sync(order)
+
+        accepted_count = sum(1 for o in mm_orders if o.state_name == "ACCEPTED")
+        print(f"    MM placed {accepted_count} orders")
+        results.check("MM orders placed", accepted_count == 4)
 
         time.sleep(0.2)
-        initial_inserts = mkt.get_summary()['inserts']
 
         print("\n  Step 2: Taker1 buys 150 shares (sweeps 2 ask levels)")
-        taker1_response = taker1.send_order("limit,150,520000,B,taker1")
-        print(f"    Taker1 response: {taker1_response}")
-        results.check("Taker1 gets fill", "FILL" in taker1_response)
+        taker1_order = taker1.create_order("limit", 150, 520000, "B", 3600)
+        taker1.submit_order_sync(taker1_order)
+        print(f"    Taker1 order state: {taker1_order.state_name}")
+        results.check("Taker1 gets fill", taker1_order.state_name == "FILLED")
 
         time.sleep(0.3)
 
         print("\n  Step 3: Taker2 sells 50 shares (hits best bid)")
-        taker2_response = taker2.send_order("limit,50,490000,S,taker2")
-        print(f"    Taker2 response: {taker2_response}")
-        results.check("Taker2 gets fill", "FILL" in taker2_response)
+        taker2_order = taker2.create_order("limit", 50, 490000, "S", 3600)
+        taker2.submit_order_sync(taker2_order)
+        print(f"    Taker2 order state: {taker2_order.state_name}")
+        results.check("Taker2 gets fill", taker2_order.state_name == "FILLED")
 
         time.sleep(0.5)
 
         print("\n  Step 4: Verify Market Maker got passive fills")
-        print(f"    MM fills: {mm.fills}")
-        # MM should have received fills for the crossed orders
-        results.check("MM received passive fills", len(mm.fills) >= 2,
-                      f"Fill count: {len(mm.fills)}")
+        filled_mm_orders = sum(1 for o in mm_orders if o.state_name in ["FILLED", "PARTIALLY_FILLED"])
+        print(f"    MM orders filled/partial: {filled_mm_orders}")
+        results.check("MM received passive fills", filled_mm_orders >= 2)
 
         print("\n  Step 5: Verify STP has all trades")
         trades = stp.get_trades()
         print(f"    STP trade count: {len(trades)}")
-        # Taker1 swept 2 levels (100+50), Taker2 hit 1 level - should be multiple trades
-        results.check("STP has multiple trades", len(trades) >= 2, f"Trades: {len(trades)}")
+        results.check("STP has multiple trades", len(trades) >= 2)
 
         print("\n  Step 6: Verify market data")
         md_summary = mkt.get_summary()
         print(f"    Market data: {md_summary}")
-        results.check("Market data has INSERTs", md_summary['inserts'] >= initial_inserts)
+        results.check("Market data has INSERTs", md_summary['inserts'] >= 4)
         results.check("Market data has EXECUTEs", md_summary['executes'] >= 2)
 
-        mm.close()
-        taker1.close()
-        taker2.close()
+        mm.disconnect()
+        taker1.disconnect()
+        taker2.disconnect()
 
     finally:
         stp.stop()
@@ -424,13 +324,6 @@ def scenario_market_maker_and_takers(results: ScenarioResults):
 def scenario_order_lifecycle(results: ScenarioResults):
     """
     Scenario: Full order lifecycle - place, partial fill, cancel remainder.
-
-    1. Trader places large order
-    2. Another trader partially fills it
-    3. First trader cancels remainder
-    4. Verify partial fill notification
-    5. Verify cancel ACK
-    6. Verify market data shows INSERT, EXECUTE, DELETE
     """
     print("\n" + "=" * 70)
     print("SCENARIO: Full Order Lifecycle")
@@ -438,46 +331,46 @@ def scenario_order_lifecycle(results: ScenarioResults):
 
     server = start_server()
     stp = STPCollector()
-    mkt = MarketDataCollector()
+    mkt = UDPBookCollector()
 
     try:
         stp.start()
         mkt.start()
         time.sleep(0.3)
 
-        trader1 = OrderClient(name="Trader1")
-        trader2 = OrderClient(name="Trader2")
-
+        trader1 = OrderClientWithFSM('localhost', 10000)
         trader1.connect()
+        trader1.start_async_receive()
+
+        trader2 = OrderClientWithFSM('localhost', 10000)
         trader2.connect()
-        time.sleep(0.2)
+        trader2.start_async_receive()
 
         print("\n  Step 1: Trader1 places large bid (500 shares @ $45)")
-        response = trader1.send_order("limit,500,450000,B,trader1")
-        print(f"    Response: {response}")
-        order_id = int(response.split(',')[1])
-        results.check("Large order ACKed", response.startswith("ACK"))
+        big_order = trader1.create_order("limit", 500, 450000, "B", 3600)
+        trader1.submit_order_sync(big_order)
+        print(f"    State: {big_order.state_name}")
+        results.check("Large order accepted", big_order.state_name == "ACCEPTED")
 
         time.sleep(0.2)
 
         print("\n  Step 2: Trader2 sells 100 shares (partial fill)")
-        response = trader2.send_order("limit,100,450000,S,trader2")
-        print(f"    Response: {response}")
-        results.check("Trader2 fill", "FILL" in response)
+        small_order = trader2.create_order("limit", 100, 450000, "S", 3600)
+        trader2.submit_order_sync(small_order)
+        print(f"    Trader2 state: {small_order.state_name}")
+        results.check("Trader2 fill", small_order.state_name == "FILLED")
 
         time.sleep(0.3)
 
         print("\n  Step 3: Verify Trader1 got partial fill notification")
-        print(f"    Trader1 fills: {trader1.fills}")
-        has_partial = any("PARTIAL_FILL" in f or "FILL" in f for f in trader1.fills)
-        results.check("Trader1 partial fill notification", has_partial)
+        print(f"    Trader1 state: {big_order.state_name}")
+        results.check("Trader1 partial fill", big_order.state_name == "PARTIALLY_FILLED")
 
         print("\n  Step 4: Trader1 cancels remainder")
-        cancel_response = trader1.send_order(f"cancel,{order_id},trader1")
-        print(f"    Cancel response: {cancel_response}")
-        results.check("Cancel ACKed", "CANCEL_ACK" in cancel_response)
-
-        time.sleep(0.3)
+        cancel_result = trader1.cancel_order(big_order)
+        time.sleep(0.2)
+        print(f"    Cancel result: {cancel_result}, State: {big_order.state_name}")
+        results.check("Cancel succeeded", big_order.state_name == "CANCELLED")
 
         print("\n  Step 5: Verify market data lifecycle")
         md_summary = mkt.get_summary()
@@ -486,8 +379,8 @@ def scenario_order_lifecycle(results: ScenarioResults):
         results.check("Has EXECUTE", md_summary['executes'] >= 1)
         results.check("Has DELETE", md_summary['deletes'] >= 1)
 
-        trader1.close()
-        trader2.close()
+        trader1.disconnect()
+        trader2.disconnect()
 
     finally:
         stp.stop()
@@ -498,10 +391,6 @@ def scenario_order_lifecycle(results: ScenarioResults):
 def scenario_multiple_stp_subscribers(results: ScenarioResults):
     """
     Scenario: Multiple STP subscribers all receive same trades.
-
-    1. Start 3 STP subscribers
-    2. Execute a trade
-    3. Verify all 3 subscribers received the trade
     """
     print("\n" + "=" * 70)
     print("SCENARIO: Multiple STP Subscribers")
@@ -518,16 +407,18 @@ def scenario_multiple_stp_subscribers(results: ScenarioResults):
         stp3.start()
         time.sleep(0.3)
 
-        alice = OrderClient(name="Alice")
-        bob = OrderClient(name="Bob")
+        alice = OrderClientWithFSM('localhost', 10000)
         alice.connect()
+        alice.start_async_receive()
+
+        bob = OrderClientWithFSM('localhost', 10000)
         bob.connect()
-        time.sleep(0.2)
+        bob.start_async_receive()
 
         print("\n  Step 1: Execute a trade")
-        alice.send_order("limit,100,500000,B,alice")
+        alice.submit_order_sync(alice.create_order("limit", 100, 500000, "B", 3600))
         time.sleep(0.1)
-        bob.send_order("limit,100,500000,S,bob")
+        bob.submit_order_sync(bob.create_order("limit", 100, 500000, "S", 3600))
         time.sleep(0.5)
 
         print("\n  Step 2: Verify all STP subscribers received trade")
@@ -543,11 +434,10 @@ def scenario_multiple_stp_subscribers(results: ScenarioResults):
         results.check("STP2 received trade", len(trades2) >= 1)
         results.check("STP3 received trade", len(trades3) >= 1)
         results.check("All subscribers got same count",
-                      len(trades1) == len(trades2) == len(trades3),
-                      f"Counts: {len(trades1)}, {len(trades2)}, {len(trades3)}")
+                      len(trades1) == len(trades2) == len(trades3))
 
-        alice.close()
-        bob.close()
+        alice.disconnect()
+        bob.disconnect()
 
     finally:
         stp1.stop()
@@ -559,10 +449,6 @@ def scenario_multiple_stp_subscribers(results: ScenarioResults):
 def scenario_rapid_trading(results: ScenarioResults):
     """
     Scenario: Rapid-fire trading to stress test.
-
-    1. Two traders rapidly exchange orders
-    2. Verify trade counts match
-    3. Verify no messages lost
     """
     print("\n" + "=" * 70)
     print("SCENARIO: Rapid Trading Stress Test")
@@ -570,47 +456,47 @@ def scenario_rapid_trading(results: ScenarioResults):
 
     server = start_server()
     stp = STPCollector()
-    mkt = MarketDataCollector()
+    mkt = UDPBookCollector()
 
     try:
         stp.start()
         mkt.start()
         time.sleep(0.3)
 
-        buyer = OrderClient(name="Buyer")
-        seller = OrderClient(name="Seller")
+        buyer = OrderClientWithFSM('localhost', 10000)
         buyer.connect()
+        buyer.start_async_receive()
+
+        seller = OrderClientWithFSM('localhost', 10000)
         seller.connect()
-        time.sleep(0.2)
+        seller.start_async_receive()
 
         num_trades = 20
         print(f"\n  Step 1: Execute {num_trades} rapid trades")
 
-        buyer_fills = 0
-        seller_fills = 0
-
+        filled_count = 0
         for i in range(num_trades):
-            price = 500000 + (i * 1000)  # Varying prices
+            price = 500000 + (i * 1000)
 
             # Seller posts, buyer takes
-            seller.send_order(f"limit,10,{price},S,seller")
-            response = buyer.send_order(f"limit,10,{price},B,buyer")
-            if "FILL" in response:
-                buyer_fills += 1
+            sell_order = seller.create_order("limit", 10, price, "S", 3600)
+            seller.submit_order_sync(sell_order)
 
-        time.sleep(1.0)  # Let everything settle
+            buy_order = buyer.create_order("limit", 10, price, "B", 3600)
+            buyer.submit_order_sync(buy_order)
 
-        print(f"    Buyer immediate fills: {buyer_fills}")
-        print(f"    Seller passive fills: {len(seller.fills)}")
+            if buy_order.state_name == "FILLED":
+                filled_count += 1
 
-        results.check("All buyer orders filled", buyer_fills == num_trades,
-                      f"Expected {num_trades}, got {buyer_fills}")
+        time.sleep(1.0)
+
+        print(f"    Buyer fills: {filled_count}")
+        results.check("All buyer orders filled", filled_count == num_trades)
 
         print("\n  Step 2: Verify STP trade count")
         trades = stp.get_trades()
         print(f"    STP trades: {len(trades)}")
-        results.check("STP has all trades", len(trades) >= num_trades,
-                      f"Expected >= {num_trades}, got {len(trades)}")
+        results.check("STP has all trades", len(trades) >= num_trades)
 
         print("\n  Step 3: Verify market data")
         md_summary = mkt.get_summary()
@@ -618,8 +504,8 @@ def scenario_rapid_trading(results: ScenarioResults):
         results.check("Market data INSERTs", md_summary['inserts'] >= num_trades)
         results.check("Market data EXECUTEs", md_summary['executes'] >= num_trades)
 
-        buyer.close()
-        seller.close()
+        buyer.disconnect()
+        seller.disconnect()
 
     finally:
         stp.stop()
@@ -627,9 +513,76 @@ def scenario_rapid_trading(results: ScenarioResults):
         stop_server(server)
 
 
+def scenario_book_builder_consistency(results: ScenarioResults):
+    """
+    Scenario: Verify BookBuilder tracks order book accurately through a sequence.
+    """
+    print("\n" + "=" * 70)
+    print("SCENARIO: Book Builder Consistency")
+    print("=" * 70)
+
+    server = start_server()
+    mkt = UDPBookCollector()
+
+    try:
+        mkt.start()
+        time.sleep(0.3)
+
+        client = OrderClientWithFSM('localhost', 10000)
+        client.connect()
+        client.start_async_receive()
+
+        print("\n  Step 1: Build initial book")
+        orders = []
+        orders.append(client.create_order("limit", 100, 4900000, "B", 3600))  # Bid $490
+        orders.append(client.create_order("limit", 200, 4800000, "B", 3600))  # Bid $480
+        orders.append(client.create_order("limit", 150, 5100000, "S", 3600))  # Ask $510
+        orders.append(client.create_order("limit", 250, 5200000, "S", 3600))  # Ask $520
+
+        for order in orders:
+            client.submit_order_sync(order)
+
+        time.sleep(0.3)
+
+        best_bid = mkt.builder.book.get_best_bid_price()
+        best_ask = mkt.builder.book.get_best_ask_price()
+        print(f"    Book builder: bid={best_bid}, ask={best_ask}")
+        results.check("Initial best bid correct", best_bid == 4900000)
+        results.check("Initial best ask correct", best_ask == 5100000)
+
+        print("\n  Step 2: Execute trade (take best ask)")
+        buy_order = client.create_order("limit", 150, 5100000, "B", 3600)
+        client.submit_order_sync(buy_order)
+
+        time.sleep(0.3)
+
+        new_best_ask = mkt.builder.book.get_best_ask_price()
+        print(f"    New best ask: {new_best_ask}")
+        results.check("Best ask updated after trade", new_best_ask == 5200000)
+
+        print("\n  Step 3: Cancel order (best bid)")
+        cancel_result = client.cancel_order(orders[0])  # Cancel best bid
+        time.sleep(0.3)
+
+        new_best_bid = mkt.builder.book.get_best_bid_price()
+        print(f"    New best bid: {new_best_bid}")
+        results.check("Best bid updated after cancel", new_best_bid == 4800000)
+
+        client.disconnect()
+
+    finally:
+        mkt.stop()
+        stop_server(server)
+
+
 def run_scenarios():
     print("=" * 70)
-    print("  MULTI-CLIENT SCENARIO INTEGRATION TESTS")
+    print("  MULTI-CLIENT SCENARIO TESTS (using actual components)")
+    print("=" * 70)
+    print("  Components under test:")
+    print("    - OrderClientWithFSM (order_client_with_fsm.py)")
+    print("    - STPClient (stp_client.py)")
+    print("    - BookBuilder (udp_book_builder.py)")
     print("=" * 70)
 
     results = ScenarioResults()
@@ -639,6 +592,7 @@ def run_scenarios():
     scenario_order_lifecycle(results)
     scenario_multiple_stp_subscribers(results)
     scenario_rapid_trading(results)
+    scenario_book_builder_consistency(results)
 
     passed, failed = results.summary()
 

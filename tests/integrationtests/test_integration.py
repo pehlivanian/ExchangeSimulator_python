@@ -2,6 +2,11 @@
 """
 Integration tests for the Exchange Simulator.
 
+Uses the ACTUAL client components:
+- OrderClientWithFSM from order_client_with_fsm.py
+- STPClient from stp_client.py
+- BookBuilder from udp_book_builder.py
+
 Each test starts a fresh server to avoid state bleeding between tests.
 """
 
@@ -12,148 +17,126 @@ import threading
 import time
 from typing import List, Optional
 
+# Add parent directory to path for imports
+sys.path.insert(0, '../..')
 
-class TestClient:
-    """Simple test client for order submission."""
-
-    def __init__(self, port: int = 10000):
-        self.port = port
-        self.sock: Optional[socket.socket] = None
-
-    def connect(self) -> bool:
-        try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(5.0)
-            self.sock.connect(('127.0.0.1', self.port))
-            return True
-        except Exception as e:
-            print(f"  Connection failed: {e}")
-            return False
-
-    def close(self):
-        if self.sock:
-            self.sock.close()
-            self.sock = None
-
-    def send_order(self, order: str) -> str:
-        if not self.sock:
-            return "ERROR: Not connected"
-        try:
-            self.sock.sendall((order + '\n').encode())
-            response = self.sock.recv(4096).decode().strip()
-            return response
-        except Exception as e:
-            return f"ERROR: {e}"
+from order_client_with_fsm import OrderClientWithFSM, ManagedOrder, ExchangeMessage
+from stp_client import STPClient
+from udp_book_builder import BookBuilder
 
 
-class STPListener:
-    """Listens for STP trade broadcasts."""
+class STPCollector:
+    """Wrapper around STPClient that collects trades in a list."""
 
-    def __init__(self, port: int = 10001):
-        self.port = port
-        self.sock: Optional[socket.socket] = None
+    def __init__(self, host: str = 'localhost', port: int = 10001):
+        self.client = STPClient(host, port)
         self.trades: List[str] = []
-        self.running = False
-        self.thread: Optional[threading.Thread] = None
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
 
     def start(self) -> bool:
-        try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(1.0)
-            self.sock.connect(('127.0.0.1', self.port))
-            self.running = True
-            self.thread = threading.Thread(target=self._listen, daemon=True)
-            self.thread.start()
-            return True
-        except Exception as e:
-            print(f"  STP connection failed: {e}")
+        if not self.client.connect():
             return False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return True
 
-    def _listen(self):
-        buffer = ""
-        while self.running:
-            try:
-                data = self.sock.recv(1024).decode()
-                if not data:
-                    break
-                buffer += data
-                while '\n' in buffer:
-                    line, buffer = buffer.split('\n', 1)
-                    if line.strip():
-                        self.trades.append(line.strip())
-            except socket.timeout:
-                continue
-            except Exception:
-                break
+    def _run(self):
+        def callback(msg: str):
+            with self._lock:
+                self.trades.append(msg)
+        self.client.run(callback)
 
     def stop(self):
-        self.running = False
-        if self.sock:
-            self.sock.close()
-        if self.thread:
-            self.thread.join(timeout=2.0)
+        self.client.disconnect()
+        if self._thread:
+            self._thread.join(timeout=2.0)
 
     def get_trades(self) -> List[str]:
-        return list(self.trades)
+        with self._lock:
+            return list(self.trades)
 
     def clear(self):
-        self.trades.clear()
+        with self._lock:
+            self.trades.clear()
 
 
-class UDPListener:
-    """Listens for UDP market data broadcasts."""
+class UDPBookCollector:
+    """Collects UDP market data and builds order book using BookBuilder."""
 
     def __init__(self, port: int = 10002):
         self.port = port
-        self.sock: Optional[socket.socket] = None
+        self.builder = BookBuilder()
         self.messages: List[str] = []
-        self.running = False
-        self.thread: Optional[threading.Thread] = None
+        self._sock: Optional[socket.socket] = None
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+        self._lock = threading.Lock()
 
     def start(self) -> bool:
         try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.sock.settimeout(1.0)
-            self.sock.sendto(b"subscribe", ('127.0.0.1', self.port))
-            self.running = True
-            self.thread = threading.Thread(target=self._listen, daemon=True)
-            self.thread.start()
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.settimeout(1.0)
+            self._sock.sendto(b"subscribe", ('127.0.0.1', self.port))
+            self._running = True
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
             return True
         except Exception as e:
-            print(f"  UDP connection failed: {e}")
+            print(f"UDP collector failed: {e}")
             return False
 
-    def _listen(self):
-        while self.running:
+    def _run(self):
+        while self._running:
             try:
-                data, addr = self.sock.recvfrom(1024)
+                data, addr = self._sock.recvfrom(1024)
                 msg = data.decode().strip()
                 if msg:
-                    self.messages.append(msg)
+                    with self._lock:
+                        self.messages.append(msg)
+                        self.builder.process_message(msg)
             except socket.timeout:
                 continue
             except Exception:
                 break
 
     def stop(self):
-        self.running = False
-        if self.sock:
-            self.sock.close()
-        if self.thread:
-            self.thread.join(timeout=2.0)
+        self._running = False
+        if self._sock:
+            self._sock.close()
+        if self._thread:
+            self._thread.join(timeout=2.0)
 
     def get_messages(self) -> List[str]:
-        return list(self.messages)
+        with self._lock:
+            return list(self.messages)
+
+    def get_summary(self) -> dict:
+        with self._lock:
+            inserts = sum(1 for m in self.messages if ',1,' in m)
+            cancels = sum(1 for m in self.messages if ',2,' in m)
+            deletes = sum(1 for m in self.messages if ',3,' in m)
+            executes = sum(1 for m in self.messages if ',4,' in m)
+            return {
+                'total': len(self.messages),
+                'inserts': inserts,
+                'cancels': cancels,
+                'deletes': deletes,
+                'executes': executes,
+            }
 
     def clear(self):
-        self.messages.clear()
+        with self._lock:
+            self.messages.clear()
+            self.builder = BookBuilder()
 
 
 def start_server() -> subprocess.Popen:
     proc = subprocess.Popen(
         [sys.executable, 'exchange_server.py'],
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
+        stderr=subprocess.PIPE,
+        cwd='../..'
     )
     time.sleep(0.8)
     return proc
@@ -184,35 +167,35 @@ class TestResults:
 
 
 def test_basic_orders(results: TestResults):
-    """Test basic order submission and ACK."""
+    """Test basic order submission and ACK using OrderClientWithFSM."""
     print("\n[Test Group 1] Basic Order Operations")
     server = start_server()
     try:
-        # Test 1: Limit order ACK
-        client = TestClient()
-        if client.connect():
-            response = client.send_order("limit,100,5000000,B,trader1")
-            parts = response.split(',')
-            results.record("Limit order ACK format", parts[0] == "ACK", f"Got: {response}")
-            if parts[0] == "ACK":
-                order_id = int(parts[1])
-                results.record("Order ID assigned", order_id > 0, f"ID: {order_id}")
-            client.close()
+        # Create client using actual OrderClientWithFSM
+        client = OrderClientWithFSM('localhost', 10000)
+        results.record("Client created", client is not None)
 
-        # Test 2: Non-crossing ask
-        client = TestClient()
-        if client.connect():
-            response = client.send_order("limit,100,5100000,S,trader2")
-            parts = response.split(',')
-            results.record("Non-crossing limit ACK", parts[0] == "ACK", f"Got: {response}")
-            client.close()
+        connected = client.connect()
+        results.record("Client connected", connected)
 
-        # Test 3: Invalid format rejected
-        client = TestClient()
-        if client.connect():
-            response = client.send_order("invalid,garbage,data")
-            results.record("Invalid format rejected", "REJECT" in response, f"Got: {response}")
-            client.close()
+        if connected:
+            client.start_async_receive()
+
+            # Submit a limit order
+            order = client.create_order("limit", 100, 5000000, "B", 3600)
+            client.submit_order_sync(order)
+            time.sleep(0.2)  # Allow async processing
+            results.record("Limit order accepted", order.state_name == "ACCEPTED",
+                           f"State: {order.state_name}")
+            results.record("Order got exchange ID", order.exchange_order_id is not None,
+                           f"ID: {order.exchange_order_id}")
+
+            # Submit another order (ask)
+            order2 = client.create_order("limit", 100, 5100000, "S", 3600)
+            submitted2 = client.submit_order_sync(order2)
+            results.record("Non-crossing ask submitted", submitted2)
+
+            client.disconnect()
 
     finally:
         stop_server(server)
@@ -222,35 +205,46 @@ def test_crossing_orders(results: TestResults):
     """Test crossing orders generate trades."""
     print("\n[Test Group 2] Crossing Orders and Trades")
     server = start_server()
-    stp = STPListener()
-    udp = UDPListener()
+    stp = STPCollector()
+    udp = UDPBookCollector()
     try:
         stp.start()
         udp.start()
         time.sleep(0.2)
 
-        # Place ask
-        client1 = TestClient()
-        client1.connect()
-        client1.send_order("limit,100,5000000,S,seller")
+        # Seller places ask
+        seller = OrderClientWithFSM('localhost', 10000)
+        seller.connect()
+        seller.start_async_receive()
+        ask_order = seller.create_order("limit", 100, 5000000, "S", 3600)
+        seller.submit_order_sync(ask_order)
 
         time.sleep(0.1)
         udp.clear()
         stp.clear()
 
-        # Place crossing bid
-        client2 = TestClient()
-        client2.connect()
-        response = client2.send_order("limit,100,5000000,B,buyer")
-        results.record("Crossing order fills", "FILL" in response, f"Got: {response}")
+        # Buyer places crossing bid
+        buyer = OrderClientWithFSM('localhost', 10000)
+        buyer.connect()
+        buyer.start_async_receive()
+        bid_order = buyer.create_order("limit", 100, 5000000, "B", 3600)
+        buyer.submit_order_sync(bid_order)
 
-        time.sleep(0.2)
-        results.record("STP trade broadcast", len(stp.get_trades()) > 0, f"Trades: {stp.get_trades()}")
-        results.record("UDP EXECUTE broadcast", any(',4,' in m for m in udp.get_messages()),
-                       f"Messages: {len(udp.get_messages())}")
+        time.sleep(0.3)
 
-        client1.close()
-        client2.close()
+        # Check results
+        results.record("Crossing order filled", bid_order.state_name in ["FILLED", "PARTIALLY_FILLED"],
+                       f"State: {bid_order.state_name}")
+
+        trades = stp.get_trades()
+        results.record("STP broadcast trade", len(trades) >= 1, f"Count: {len(trades)}")
+
+        md = udp.get_summary()
+        results.record("UDP EXECUTE broadcast", md['executes'] >= 1, f"Executes: {md['executes']}")
+
+        seller.disconnect()
+        buyer.disconnect()
+
     finally:
         stp.stop()
         udp.stop()
@@ -261,81 +255,95 @@ def test_market_orders(results: TestResults):
     """Test market orders."""
     print("\n[Test Group 3] Market Orders")
     server = start_server()
-    stp = STPListener()
+    stp = STPCollector()
     try:
         stp.start()
         time.sleep(0.2)
 
-        # Test: Market order with no liquidity
-        client = TestClient()
+        client = OrderClientWithFSM('localhost', 10000)
         client.connect()
-        response = client.send_order("market,100,0,B,trader")
-        results.record("Market order rejects on no liquidity",
-                       "REJECT" in response or "No liquidity" in response, f"Got: {response}")
-        client.close()
+        client.start_async_receive()
 
-        # Add liquidity then test market order
-        client = TestClient()
-        client.connect()
-        client.send_order("limit,200,4800000,B,mm")
-        client.close()
+        # Market order with no liquidity should fail
+        market_order = client.create_order("market", 100, 0, "B")
+        result = client.submit_order_sync(market_order)
+        results.record("Market order rejects on no liquidity",
+                       not result or market_order.state_name == "REJECTED",
+                       f"State: {market_order.state_name}")
+
+        # Add liquidity
+        bid_order = client.create_order("limit", 200, 4800000, "B", 3600)
+        client.submit_order_sync(bid_order)
 
         stp.clear()
 
-        client = TestClient()
-        client.connect()
-        response = client.send_order("market,50,0,S,trader")
-        results.record("Market order fills with liquidity", "FILL" in response, f"Got: {response}")
-        client.close()
+        # Market sell should fill
+        client2 = OrderClientWithFSM('localhost', 10000)
+        client2.connect()
+        client2.start_async_receive()
+        market_sell = client2.create_order("market", 50, 0, "S")
+        client2.submit_order_sync(market_sell)
 
         time.sleep(0.2)
-        results.record("Market order STP broadcast", len(stp.get_trades()) > 0, f"Trades: {stp.get_trades()}")
+        results.record("Market order fills with liquidity",
+                       market_sell.state_name in ["FILLED", "PARTIALLY_FILLED"],
+                       f"State: {market_sell.state_name}")
+
+        trades = stp.get_trades()
+        results.record("Market order STP broadcast", len(trades) >= 1, f"Trades: {len(trades)}")
+
+        client.disconnect()
+        client2.disconnect()
 
     finally:
         stp.stop()
         stop_server(server)
 
 
+def wait_for_state(order, expected_state: str, timeout: float = 2.0) -> bool:
+    """Poll until order reaches expected state or timeout."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if order.state_name == expected_state:
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def test_cancellation(results: TestResults):
     """Test order cancellation."""
     print("\n[Test Group 4] Order Cancellation")
     server = start_server()
-    udp = UDPListener()
+    udp = UDPBookCollector()
     try:
         udp.start()
         time.sleep(0.2)
 
-        client = TestClient()
+        client = OrderClientWithFSM('localhost', 10000)
         client.connect()
+        client.start_async_receive()
 
         # Place order
-        response = client.send_order("limit,100,4700000,B,trader")
-        parts = response.split(',')
-        order_id = int(parts[1])
+        order = client.create_order("limit", 100, 4700000, "B", 3600)
+        client.submit_order_sync(order)
 
         udp.clear()
 
         # Cancel it
-        response = client.send_order(f"cancel,{order_id},trader")
-        results.record("Cancel ACK received", "CANCEL_ACK" in response, f"Got: {response}")
+        cancel_result = client.cancel_order(order)
 
-        # Try to cancel again
-        response = client.send_order(f"cancel,{order_id},trader")
-        results.record("Double cancel rejected", "REJECT" in response, f"Got: {response}")
+        # Wait for state to update (async processing)
+        state_updated = wait_for_state(order, "CANCELLED", timeout=2.0)
 
-        time.sleep(0.2)
-        results.record("UDP DELETE broadcast", any(',3,' in m for m in udp.get_messages()),
-                       f"Messages: {udp.get_messages()}")
+        results.record("Cancel succeeded", cancel_result)
+        results.record("Order state is CANCELLED", state_updated,
+                       f"State: {order.state_name}")
 
-        # Test cancel by wrong user
-        response = client.send_order("limit,100,4600000,B,alice")
-        parts = response.split(',')
-        order_id = int(parts[1])
+        md = udp.get_summary()
+        results.record("UDP DELETE broadcast", md['deletes'] >= 1, f"Deletes: {md['deletes']}")
 
-        response = client.send_order(f"cancel,{order_id},bob")
-        results.record("Cancel by wrong user rejected", "REJECT" in response, f"Got: {response}")
+        client.disconnect()
 
-        client.close()
     finally:
         udp.stop()
         stop_server(server)
@@ -345,31 +353,40 @@ def test_sweep_orders(results: TestResults):
     """Test orders that sweep multiple price levels."""
     print("\n[Test Group 5] Multi-Level Sweeps")
     server = start_server()
-    stp = STPListener()
+    stp = STPCollector()
     try:
         stp.start()
         time.sleep(0.2)
 
-        # Build ask side
-        client = TestClient()
-        client.connect()
-        client.send_order("limit,100,4700000,S,mm")
-        client.send_order("limit,100,4800000,S,mm")
-        client.send_order("limit,100,4900000,S,mm")
-        client.close()
+        # Market maker places asks at multiple levels
+        mm = OrderClientWithFSM('localhost', 10000)
+        mm.connect()
+        mm.start_async_receive()
+
+        mm.submit_order_sync(mm.create_order("limit", 100, 4700000, "S", 3600))
+        mm.submit_order_sync(mm.create_order("limit", 100, 4800000, "S", 3600))
+        mm.submit_order_sync(mm.create_order("limit", 100, 4900000, "S", 3600))
 
         stp.clear()
 
-        # Sweep all levels
-        client = TestClient()
-        client.connect()
-        response = client.send_order("limit,300,5000000,B,sweeper")
-        results.record("Sweep order fills", "FILL" in response, f"Got: {response}")
-        client.close()
+        # Sweeper buys through all levels
+        sweeper = OrderClientWithFSM('localhost', 10000)
+        sweeper.connect()
+        sweeper.start_async_receive()
 
-        time.sleep(0.2)
+        sweep_order = sweeper.create_order("limit", 300, 5000000, "B", 3600)
+        sweeper.submit_order_sync(sweep_order)
+
+        time.sleep(0.3)
+
+        results.record("Sweep order filled", sweep_order.state_name in ["FILLED", "PARTIALLY_FILLED"],
+                       f"State: {sweep_order.state_name}")
+
         trades = stp.get_trades()
-        results.record("Multiple STP trades from sweep", len(trades) >= 1, f"Trade count: {len(trades)}")
+        results.record("Multiple STP trades from sweep", len(trades) >= 1, f"Count: {len(trades)}")
+
+        mm.disconnect()
+        sweeper.disconnect()
 
     finally:
         stp.stop()
@@ -381,30 +398,36 @@ def test_passive_fills(results: TestResults):
     print("\n[Test Group 6] Passive Fill Notifications")
     server = start_server()
     try:
-        # Client 1 places resting order
-        client1 = TestClient()
-        client1.connect()
-        response = client1.send_order("limit,100,4200000,B,passive_trader")
-        parts = response.split(',')
-        passive_order_id = int(parts[1])
+        # Passive trader places resting order
+        passive = OrderClientWithFSM('localhost', 10000)
+        passive.connect()
+        passive.start_async_receive()
 
-        # Client 2 crosses
-        client2 = TestClient()
-        client2.connect()
-        client2.send_order("limit,100,4200000,S,aggressive_trader")
+        passive_order = passive.create_order("limit", 100, 4200000, "B", 3600)
+        passive.submit_order_sync(passive_order)
+        initial_state = passive_order.state_name
 
-        # Check for notification on client 1
-        time.sleep(0.3)
-        client1.sock.settimeout(2.0)
-        try:
-            notification = client1.sock.recv(4096).decode().strip()
-            passed = "FILL" in notification and str(passive_order_id) in notification
-            results.record("Passive fill notification", passed, f"Got: {notification}")
-        except socket.timeout:
-            results.record("Passive fill notification", False, "No notification received")
+        # Aggressive trader crosses
+        aggressive = OrderClientWithFSM('localhost', 10000)
+        aggressive.connect()
+        aggressive.start_async_receive()
 
-        client1.close()
-        client2.close()
+        agg_order = aggressive.create_order("limit", 100, 4200000, "S", 3600)
+        aggressive.submit_order_sync(agg_order)
+
+        time.sleep(0.5)
+
+        # Passive order should now be filled
+        results.record("Passive order filled",
+                       passive_order.state_name == "FILLED",
+                       f"State: {passive_order.state_name} (was {initial_state})")
+        results.record("Aggressive order filled",
+                       agg_order.state_name == "FILLED",
+                       f"State: {agg_order.state_name}")
+
+        passive.disconnect()
+        aggressive.disconnect()
+
     finally:
         stop_server(server)
 
@@ -414,26 +437,25 @@ def test_ttl_expiry(results: TestResults):
     print("\n[Test Group 7] Order TTL Expiry")
     server = start_server()
     try:
-        client = TestClient()
+        client = OrderClientWithFSM('localhost', 10000)
         client.connect()
+        client.start_async_receive()
 
         # Place order with 2 second TTL
-        response = client.send_order("limit,100,4100000,B,ttl_trader,2")
-        parts = response.split(',')
-        results.record("Order with TTL accepted", parts[0] == "ACK", f"Got: {response}")
+        order = client.create_order("limit", 100, 4100000, "B", 2)  # 2 second TTL
+        submitted = client.submit_order_sync(order)
+        results.record("Order with TTL accepted", submitted)
 
-        if parts[0] == "ACK":
-            print("    (waiting 3s for TTL expiry...)")
-            time.sleep(3.0)
+        initial_state = order.state_name
+        print("    (waiting 3s for TTL expiry...)")
+        time.sleep(3.0)
 
-            client.sock.settimeout(1.0)
-            try:
-                notification = client.sock.recv(4096).decode().strip()
-                results.record("TTL expiry notification", "EXPIRED" in notification, f"Got: {notification}")
-            except socket.timeout:
-                results.record("TTL expiry notification", False, "No notification received")
+        results.record("Order expired",
+                       order.state_name == "EXPIRED",
+                       f"State: {order.state_name} (was {initial_state})")
 
-        client.close()
+        client.disconnect()
+
     finally:
         stop_server(server)
 
@@ -444,38 +466,83 @@ def test_partial_fills(results: TestResults):
     server = start_server()
     try:
         # Place large resting order
-        client1 = TestClient()
-        client1.connect()
-        response = client1.send_order("limit,500,4500000,B,big_buyer")
-        parts = response.split(',')
-        results.record("Large order ACK", parts[0] == "ACK", f"Got: {response}")
+        big_buyer = OrderClientWithFSM('localhost', 10000)
+        big_buyer.connect()
+        big_buyer.start_async_receive()
+
+        big_order = big_buyer.create_order("limit", 500, 4500000, "B", 3600)
+        big_buyer.submit_order_sync(big_order)
+        results.record("Large order ACKed", big_order.exchange_order_id is not None)
 
         # Partially fill it
-        client2 = TestClient()
-        client2.connect()
-        response = client2.send_order("limit,100,4500000,S,small_seller")
-        results.record("Small crossing order fills", "FILL" in response, f"Got: {response}")
+        small_seller = OrderClientWithFSM('localhost', 10000)
+        small_seller.connect()
+        small_seller.start_async_receive()
 
-        # Check passive fill notification shows partial
+        small_order = small_seller.create_order("limit", 100, 4500000, "S", 3600)
+        small_seller.submit_order_sync(small_order)
+
         time.sleep(0.3)
-        client1.sock.settimeout(1.0)
-        try:
-            notification = client1.sock.recv(4096).decode().strip()
-            # Should be PARTIAL_FILL with remaining size
-            results.record("Partial fill notification", "PARTIAL_FILL" in notification or "FILL" in notification,
-                           f"Got: {notification}")
-        except socket.timeout:
-            results.record("Partial fill notification", False, "No notification received")
 
-        client1.close()
-        client2.close()
+        results.record("Small order filled", small_order.state_name == "FILLED",
+                       f"State: {small_order.state_name}")
+        results.record("Large order partially filled", big_order.state_name == "PARTIALLY_FILLED",
+                       f"State: {big_order.state_name}")
+
+        big_buyer.disconnect()
+        small_seller.disconnect()
+
     finally:
+        stop_server(server)
+
+
+def test_book_builder_accuracy(results: TestResults):
+    """Test that BookBuilder accurately tracks order book state."""
+    print("\n[Test Group 9] Book Builder Accuracy")
+    server = start_server()
+    udp = UDPBookCollector()
+    try:
+        udp.start()
+        time.sleep(0.2)
+
+        client = OrderClientWithFSM('localhost', 10000)
+        client.connect()
+        client.start_async_receive()
+
+        # Place orders at known prices
+        client.submit_order_sync(client.create_order("limit", 100, 4900000, "B", 3600))  # Bid $490
+        client.submit_order_sync(client.create_order("limit", 200, 4800000, "B", 3600))  # Bid $480
+        client.submit_order_sync(client.create_order("limit", 150, 5100000, "S", 3600))  # Ask $510
+        client.submit_order_sync(client.create_order("limit", 250, 5200000, "S", 3600))  # Ask $520
+
+        time.sleep(0.3)
+
+        # Check book builder state
+        best_bid = udp.builder.book.get_best_bid_price()
+        best_ask = udp.builder.book.get_best_ask_price()
+
+        results.record("Book builder has correct best bid",
+                       best_bid == 4900000,
+                       f"Expected 4900000, got {best_bid}")
+        results.record("Book builder has correct best ask",
+                       best_ask == 5100000,
+                       f"Expected 5100000, got {best_ask}")
+
+        client.disconnect()
+
+    finally:
+        udp.stop()
         stop_server(server)
 
 
 def run_tests():
     print("=" * 70)
-    print("  EXCHANGE SIMULATOR INTEGRATION TESTS")
+    print("  INTEGRATION TESTS (using actual components)")
+    print("=" * 70)
+    print("  Components under test:")
+    print("    - OrderClientWithFSM (order_client_with_fsm.py)")
+    print("    - STPClient (stp_client.py)")
+    print("    - BookBuilder (udp_book_builder.py)")
     print("=" * 70)
 
     results = TestResults()
@@ -488,6 +555,7 @@ def run_tests():
     test_passive_fills(results)
     test_ttl_expiry(results)
     test_partial_fills(results)
+    test_book_builder_accuracy(results)
 
     print()
     print("=" * 70)

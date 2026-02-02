@@ -241,5 +241,5 @@ if __name__ == '__main__':
     print("This module provides UDPMarketDataServer for broadcasting market data.")
     print("It is used internally by exchange_server.py.")
     print()
-    print("To receive market data, run:  python udp_market_data_client.py")
+    print("To receive market data, run:  python udp_book_builder.py")
     print("To start the exchange, run:   python exchange_server.py")
