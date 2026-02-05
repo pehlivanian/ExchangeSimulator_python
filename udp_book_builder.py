@@ -7,13 +7,14 @@ and displays the book state.
 
 Usage:
     python udp_book_builder.py [--port PORT] [--levels N] [--update-every N]
+    python udp_book_builder.py --plot-after 10000 --save-plot bid_ask.pdf
 """
 
 import argparse
 import socket
 import sys
 import time
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from order_book import OrderBook
 from messages import EventLOBSTER, EventType
@@ -31,11 +32,17 @@ class BookBuilder:
         5: EventType.HIDDEN,
     }
 
-    def __init__(self):
+    def __init__(self, record_prices: bool = False):
         self.book = OrderBook()
         self.message_count = 0
         self.trade_count = 0
         self._seq_num = 0
+
+        # Price recording for plotting
+        self._record_prices = record_prices
+        self.timestamps: List[float] = []
+        self.bid_prices: List[Optional[float]] = []
+        self.ask_prices: List[Optional[float]] = []
 
     def process_message(self, lobster_line: str) -> bool:
         """
@@ -86,6 +93,14 @@ class BookBuilder:
             self.message_count += 1
             if trades:
                 self.trade_count += len(trades)
+
+            # Record bid/ask prices if enabled
+            if self._record_prices:
+                bid = self.book.get_best_bid_price()
+                ask = self.book.get_best_ask_price()
+                self.timestamps.append(time_val)
+                self.bid_prices.append(bid / 10000.0 if bid else None)
+                self.ask_prices.append(ask / 10000.0 if ask else None)
 
             return True
 
@@ -144,6 +159,61 @@ class BookBuilder:
 
         return "\n".join(lines)
 
+    def save_plot(self, filename: str) -> bool:
+        """
+        Save a plot of bid/ask prices over time to a PDF file.
+
+        Args:
+            filename: Output PDF filename
+
+        Returns:
+            True if plot was saved successfully, False otherwise.
+        """
+        if not self.timestamps:
+            print("No data to plot.")
+            return False
+
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.dates as mdates
+            from datetime import datetime, timedelta
+        except ImportError:
+            print("Error: matplotlib is required for plotting. Install with: pip install matplotlib")
+            return False
+
+        # Convert timestamps (seconds after midnight) to datetime for better axis labels
+        base_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        times = [base_date + timedelta(seconds=t) for t in self.timestamps]
+
+        # Create figure
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        # Plot bid and ask prices
+        ax.plot(times, self.bid_prices, 'b-', label='Bid', linewidth=0.5, alpha=0.8)
+        ax.plot(times, self.ask_prices, 'r-', label='Ask', linewidth=0.5, alpha=0.8)
+
+        # Formatting
+        ax.set_xlabel('Time')
+        ax.set_ylabel('Price ($)')
+        ax.set_title(f'Bid/Ask Prices ({self.message_count:,} messages)')
+        ax.legend(loc='best')
+        ax.grid(True, alpha=0.3)
+
+        # Format x-axis as time
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+        fig.autofmt_xdate()
+
+        # Tight layout
+        plt.tight_layout()
+
+        # Save to PDF
+        plt.savefig(filename, format='pdf', dpi=150)
+        plt.close()
+
+        print(f"Plot saved to {filename}")
+        return True
+
 
 def clear_screen():
     """Clear the terminal screen."""
@@ -162,6 +232,10 @@ def main():
                         help='Update display every N messages (default: 1)')
     parser.add_argument('--no-clear', action='store_true',
                         help='Do not clear screen between updates')
+    parser.add_argument('--save-plot', type=str, metavar='FILENAME',
+                        help='Save bid/ask plot to PDF file')
+    parser.add_argument('--plot-after', type=int, default=0, metavar='N',
+                        help='Save plot after N messages (0=at end only)')
     args = parser.parse_args()
 
     # Create UDP socket
@@ -175,11 +249,18 @@ def main():
     print(f"Subscribed to market data on port {args.port}")
     print(f"Building order book from LOBSTER format messages...")
     print(f"Display levels: {args.levels}, Update every: {args.update_every} messages")
+    if args.save_plot:
+        print(f"Will save plot to: {args.save_plot}")
+        if args.plot_after > 0:
+            print(f"Plot will be saved after {args.plot_after} messages")
     print("Press Ctrl+C to stop.")
     print()
 
-    builder = BookBuilder()
+    # Enable price recording if plotting is requested
+    record_prices = args.save_plot is not None
+    builder = BookBuilder(record_prices=record_prices)
     last_display_count = 0
+    plot_saved = False
 
     try:
         while True:
@@ -195,6 +276,12 @@ def main():
                         print(builder.get_book_display(args.levels))
                         last_display_count = builder.message_count
 
+                    # Save plot if threshold reached
+                    if (args.save_plot and args.plot_after > 0 and
+                            not plot_saved and builder.message_count >= args.plot_after):
+                        builder.save_plot(args.save_plot)
+                        plot_saved = True
+
             except socket.timeout:
                 print("(waiting for data...)")
                 continue
@@ -203,6 +290,9 @@ def main():
         print(f"\n\nFinal state after {builder.message_count} messages:")
         print(builder.get_book_display(args.levels))
     finally:
+        # Save plot if requested and not already saved
+        if args.save_plot and not plot_saved:
+            builder.save_plot(args.save_plot)
         sock.close()
 
 

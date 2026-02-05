@@ -179,12 +179,9 @@ def test_basic_orders(results: TestResults):
         results.record("Client connected", connected)
 
         if connected:
-            client.start_async_receive()
-
-            # Submit a limit order
+            # Submit a limit order (sync, no async receive needed)
             order = client.create_order("limit", 100, 5000000, "B", 3600)
             client.submit_order_sync(order)
-            time.sleep(0.2)  # Allow async processing
             results.record("Limit order accepted", order.state_name == "ACCEPTED",
                            f"State: {order.state_name}")
             results.record("Order got exchange ID", order.exchange_order_id is not None,
@@ -193,7 +190,9 @@ def test_basic_orders(results: TestResults):
             # Submit another order (ask)
             order2 = client.create_order("limit", 100, 5100000, "S", 3600)
             submitted2 = client.submit_order_sync(order2)
-            results.record("Non-crossing ask submitted", submitted2)
+            results.record("Non-crossing ask submitted",
+                           order2.state_name == "ACCEPTED",
+                           f"State: {order2.state_name}")
 
             client.disconnect()
 
@@ -215,7 +214,6 @@ def test_crossing_orders(results: TestResults):
         # Seller places ask
         seller = OrderClientWithFSM('localhost', 10000)
         seller.connect()
-        seller.start_async_receive()
         ask_order = seller.create_order("limit", 100, 5000000, "S", 3600)
         seller.submit_order_sync(ask_order)
 
@@ -226,7 +224,6 @@ def test_crossing_orders(results: TestResults):
         # Buyer places crossing bid
         buyer = OrderClientWithFSM('localhost', 10000)
         buyer.connect()
-        buyer.start_async_receive()
         bid_order = buyer.create_order("limit", 100, 5000000, "B", 3600)
         buyer.submit_order_sync(bid_order)
 
@@ -262,13 +259,12 @@ def test_market_orders(results: TestResults):
 
         client = OrderClientWithFSM('localhost', 10000)
         client.connect()
-        client.start_async_receive()
 
         # Market order with no liquidity should fail
         market_order = client.create_order("market", 100, 0, "B")
-        result = client.submit_order_sync(market_order)
+        client.submit_order_sync(market_order)
         results.record("Market order rejects on no liquidity",
-                       not result or market_order.state_name == "REJECTED",
+                       market_order.state_name == "REJECTED",
                        f"State: {market_order.state_name}")
 
         # Add liquidity
@@ -280,7 +276,6 @@ def test_market_orders(results: TestResults):
         # Market sell should fill
         client2 = OrderClientWithFSM('localhost', 10000)
         client2.connect()
-        client2.start_async_receive()
         market_sell = client2.create_order("market", 50, 0, "S")
         client2.submit_order_sync(market_sell)
 
@@ -342,6 +337,7 @@ def test_cancellation(results: TestResults):
         md = udp.get_summary()
         results.record("UDP DELETE broadcast", md['deletes'] >= 1, f"Deletes: {md['deletes']}")
 
+        client._running = False  # Stop async receive cleanly
         client.disconnect()
 
     finally:
@@ -361,7 +357,6 @@ def test_sweep_orders(results: TestResults):
         # Market maker places asks at multiple levels
         mm = OrderClientWithFSM('localhost', 10000)
         mm.connect()
-        mm.start_async_receive()
 
         mm.submit_order_sync(mm.create_order("limit", 100, 4700000, "S", 3600))
         mm.submit_order_sync(mm.create_order("limit", 100, 4800000, "S", 3600))
@@ -372,7 +367,6 @@ def test_sweep_orders(results: TestResults):
         # Sweeper buys through all levels
         sweeper = OrderClientWithFSM('localhost', 10000)
         sweeper.connect()
-        sweeper.start_async_receive()
 
         sweep_order = sweeper.create_order("limit", 300, 5000000, "B", 3600)
         sweeper.submit_order_sync(sweep_order)
@@ -410,21 +404,21 @@ def test_passive_fills(results: TestResults):
         # Aggressive trader crosses
         aggressive = OrderClientWithFSM('localhost', 10000)
         aggressive.connect()
-        aggressive.start_async_receive()
 
         agg_order = aggressive.create_order("limit", 100, 4200000, "S", 3600)
         aggressive.submit_order_sync(agg_order)
 
-        time.sleep(0.5)
+        # Wait for passive fill notification to arrive
+        passive_filled = wait_for_state(passive_order, "FILLED", timeout=2.0)
 
         # Passive order should now be filled
-        results.record("Passive order filled",
-                       passive_order.state_name == "FILLED",
+        results.record("Passive order filled", passive_filled,
                        f"State: {passive_order.state_name} (was {initial_state})")
         results.record("Aggressive order filled",
                        agg_order.state_name == "FILLED",
                        f"State: {agg_order.state_name}")
 
+        passive._running = False  # Stop async receive cleanly
         passive.disconnect()
         aggressive.disconnect()
 
@@ -439,21 +433,29 @@ def test_ttl_expiry(results: TestResults):
     try:
         client = OrderClientWithFSM('localhost', 10000)
         client.connect()
+
+        # Place order with 5 second TTL (enough time to verify acceptance)
+        order = client.create_order("limit", 100, 4100000, "B", 5)  # 5 second TTL
+        client.submit_order_sync(order)
+
+        # Immediately check acceptance (before TTL expires)
+        accepted = order.state_name == "ACCEPTED"
+        results.record("Order with TTL accepted", accepted,
+                       f"State: {order.state_name}")
+
+        # Now start async receive to catch the expiry notification
         client.start_async_receive()
+        time.sleep(0.1)  # Let async thread start
 
-        # Place order with 2 second TTL
-        order = client.create_order("limit", 100, 4100000, "B", 2)  # 2 second TTL
-        submitted = client.submit_order_sync(order)
-        results.record("Order with TTL accepted", submitted)
+        print("    (waiting 6s for TTL expiry...)")
+        time.sleep(6.0)
 
-        initial_state = order.state_name
-        print("    (waiting 3s for TTL expiry...)")
-        time.sleep(3.0)
+        # Wait for EXPIRED state
+        expired = wait_for_state(order, "EXPIRED", timeout=2.0)
+        results.record("Order expired", expired,
+                       f"State: {order.state_name}")
 
-        results.record("Order expired",
-                       order.state_name == "EXPIRED",
-                       f"State: {order.state_name} (was {initial_state})")
-
+        client._running = False  # Stop async receive cleanly
         client.disconnect()
 
     finally:
@@ -468,27 +470,31 @@ def test_partial_fills(results: TestResults):
         # Place large resting order
         big_buyer = OrderClientWithFSM('localhost', 10000)
         big_buyer.connect()
-        big_buyer.start_async_receive()
 
         big_order = big_buyer.create_order("limit", 500, 4500000, "B", 3600)
         big_buyer.submit_order_sync(big_order)
         results.record("Large order ACKed", big_order.exchange_order_id is not None)
 
+        # Start async receive AFTER order is placed, to catch passive fills
+        big_buyer.start_async_receive()
+        time.sleep(0.2)  # Let async thread start
+
         # Partially fill it
         small_seller = OrderClientWithFSM('localhost', 10000)
         small_seller.connect()
-        small_seller.start_async_receive()
 
         small_order = small_seller.create_order("limit", 100, 4500000, "S", 3600)
         small_seller.submit_order_sync(small_order)
 
-        time.sleep(0.3)
+        # Wait for passive partial fill notification
+        partial_filled = wait_for_state(big_order, "PARTIALLY_FILLED", timeout=3.0)
 
         results.record("Small order filled", small_order.state_name == "FILLED",
                        f"State: {small_order.state_name}")
-        results.record("Large order partially filled", big_order.state_name == "PARTIALLY_FILLED",
+        results.record("Large order partially filled", partial_filled,
                        f"State: {big_order.state_name}")
 
+        big_buyer._running = False  # Stop async receive cleanly
         big_buyer.disconnect()
         small_seller.disconnect()
 
@@ -507,7 +513,6 @@ def test_book_builder_accuracy(results: TestResults):
 
         client = OrderClientWithFSM('localhost', 10000)
         client.connect()
-        client.start_async_receive()
 
         # Place orders at known prices
         client.submit_order_sync(client.create_order("limit", 100, 4900000, "B", 3600))  # Bid $490

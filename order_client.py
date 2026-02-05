@@ -142,7 +142,43 @@ class OrderClient:
                         if callback:
                             callback(line)
                         else:
-                            print(f"[ASYNC] {line}", flush=True)
+                            # Format messages for display
+                            formatted = self._format_message(line)
+                            print(f"[ASYNC] {formatted}", flush=True)
+
+    def _format_message(self, line: str) -> str:
+        """Format a message for display, converting prices to dollars."""
+        parts = line.split(',')
+        if not parts:
+            return line
+        msg_type = parts[0]
+        try:
+            if msg_type == 'FILL' and len(parts) >= 4:
+                order_id = parts[1]
+                size = int(parts[2])
+                price = int(parts[3])
+                price_str = f"${price / 10000:.2f}"
+                return f"FILL Order {order_id}: {size} @ {price_str}"
+            elif msg_type == 'PARTIAL_FILL' and len(parts) >= 5:
+                order_id = parts[1]
+                size = int(parts[2])
+                price = int(parts[3])
+                remainder = int(parts[4])
+                price_str = f"${price / 10000:.2f}"
+                return f"PARTIAL_FILL Order {order_id}: {size} @ {price_str}, {remainder} remaining"
+            elif msg_type == 'ACK' and len(parts) >= 4:
+                order_id = parts[1]
+                size = int(parts[2])
+                price = int(parts[3])
+                price_str = f"${price / 10000:.2f}"
+                return f"ACK Order {order_id}: {size} @ {price_str}"
+            elif msg_type == 'CANCEL_ACK' and len(parts) >= 3:
+                order_id = parts[1]
+                size = int(parts[2])
+                return f"CANCEL_ACK Order {order_id}: {size} cancelled"
+        except (ValueError, IndexError):
+            pass
+        return line
 
             except BlockingIOError:
                 time.sleep(0.01)  # 10ms

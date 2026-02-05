@@ -525,7 +525,7 @@ Price format: price * 10000 (e.g., $5000.00 = 50000000)
 
 def main():
     parser = argparse.ArgumentParser(description='Order Client with FSM')
-    parser.add_argument('--host', default='localhost')
+    parser.add_argument('--host', default='10.206.79.210')
     parser.add_argument('--port', type=int, default=10000)
     parser.add_argument('-q', '--quiet', action='store_true')
     args = parser.parse_args()
@@ -533,7 +533,12 @@ def main():
     client = OrderClientWithFSM(args.host, args.port)
 
     def on_message(order: ManagedOrder, msg: ExchangeMessage):
-        print(f"[{msg.msg_type}] Order {order.exchange_order_id}: {order.state_name}")
+        if msg.msg_type in ("FILL", "PARTIAL_FILL") and msg.size and msg.price:
+            price_str = f"${msg.price / 10000:.2f}"
+            remainder = f", {msg.remainder_size} remaining" if msg.remainder_size else ""
+            print(f"[{msg.msg_type}] Order {order.exchange_order_id}: {msg.size} @ {price_str}{remainder}")
+        else:
+            print(f"[{msg.msg_type}] Order {order.exchange_order_id}: {order.state_name}")
 
     client.set_message_callback(on_message)
 

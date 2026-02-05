@@ -764,7 +764,7 @@ class HistoricalReplayServer:
     def run(self, print_every: int = 0, validate: bool = True,
             max_messages: int = 0, verbose: bool = False,
             skip_initial: int = 0, wait_subscribers: int = 0,
-            wait_ready: bool = False) -> None:
+            wait_ready: bool = False, throttle_us: int = 0) -> None:
         """
         Run the historical replay.
 
@@ -776,6 +776,7 @@ class HistoricalReplayServer:
             skip_initial: Skip validation for first N messages (book warmup)
             wait_subscribers: Wait until this many UDP subscribers connect (0 = don't wait)
             wait_ready: Wait for user to press Enter before starting replay
+            throttle_us: Microseconds to sleep between UDP sends (0 = no throttle)
         """
         reader = LOBSTERReader(self.message_file, self.orderbook_file)
 
@@ -800,6 +801,8 @@ class HistoricalReplayServer:
             print(f"  Skip initial:   {skip_initial} messages (warmup)")
         if max_messages > 0:
             print(f"  Max messages:   {max_messages}")
+        if throttle_us > 0:
+            print(f"  Throttle:       {throttle_us} µs between sends")
         print("=" * 70)
         if validate and self.orderbook_file:
             print()
@@ -830,7 +833,7 @@ class HistoricalReplayServer:
                 input("Press Enter to start replay...")
                 print()
 
-            self._run_replay(reader, print_every, validate, max_messages, verbose, skip_initial)
+            self._run_replay(reader, print_every, validate, max_messages, verbose, skip_initial, throttle_us)
         finally:
             # Stop UDP server
             if self._market_data_server:
@@ -838,8 +841,10 @@ class HistoricalReplayServer:
                 self._market_data_server = None
 
     def _run_replay(self, reader: LOBSTERReader, print_every: int, validate: bool,
-                    max_messages: int, verbose: bool, skip_initial: int) -> None:
+                    max_messages: int, verbose: bool, skip_initial: int,
+                    throttle_us: int = 0) -> None:
         """Internal replay loop."""
+        throttle_s = throttle_us / 1_000_000.0 if throttle_us > 0 else 0
         for msg, expected_book in reader.read_messages_with_orderbook():
             self._message_count += 1
 
@@ -877,6 +882,8 @@ class HistoricalReplayServer:
             if self._market_data_server:
                 lobster_line = f"{msg.time:.9f},{msg.event_type},{msg.order_id},{msg.size},{msg.price},{msg.direction}"
                 self._market_data_server.broadcast_raw(lobster_line)
+                if throttle_s > 0:
+                    time.sleep(throttle_s)
 
             # Validate against expected orderbook (skip during warmup period)
             if validate and expected_book and self.orderbook_file and self._message_count > skip_initial:
@@ -945,6 +952,7 @@ UDP Market Data (default port 10002):
                                       (LOBSTER format: Time,Type,ID,Size,Price,Dir)
   --wait-subscribers N              - Wait for N subscribers before starting
   --wait-ready                      - Wait for Enter key before starting
+  --throttle MICROSECONDS           - Microseconds between UDP sends (0=no throttle)
 """
     )
     # Live mode options
@@ -978,6 +986,8 @@ UDP Market Data (default port 10002):
                         help='Wait for N UDP subscribers before starting replay')
     parser.add_argument('--wait-ready', action='store_true',
                         help='Wait for user to press Enter before starting replay')
+    parser.add_argument('--throttle', type=int, default=0, metavar='MICROSECONDS',
+                        help='Microseconds to sleep between UDP sends (0=no throttle)')
 
     args = parser.parse_args()
 
@@ -996,7 +1006,8 @@ UDP Market Data (default port 10002):
                 verbose=args.verbose,
                 skip_initial=args.skip_initial,
                 wait_subscribers=args.wait_subscribers,
-                wait_ready=args.wait_ready
+                wait_ready=args.wait_ready,
+                throttle_us=args.throttle
             )
         except FileNotFoundError as e:
             logger.error(str(e))

@@ -71,12 +71,28 @@ class STPClient:
                         if callback:
                             callback(line)
                         else:
-                            print(f"[STP] {line}", flush=True)
+                            # Format TRADE messages with readable price
+                            formatted = self._format_message(line)
+                            print(f"[STP] {formatted}", flush=True)
 
             except Exception as e:
                 if self._running:
                     print(f"Receive error: {e}", file=sys.stderr)
                 break
+
+    def _format_message(self, line: str) -> str:
+        """Format a message for display, converting prices to dollars."""
+        parts = line.split(',')
+        if len(parts) >= 4 and parts[0] == 'TRADE':
+            try:
+                size = int(parts[1])
+                price = int(parts[2])
+                side = parts[3]
+                price_str = f"${price / 10000:.2f}"
+                return f"TRADE {side} {size} @ {price_str}"
+            except (ValueError, IndexError):
+                pass
+        return line
 
 
 def main():
