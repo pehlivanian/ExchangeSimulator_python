@@ -378,7 +378,7 @@ class ExchangeServer:
         ack, trades = self._order_book.process_event(insert_event)
 
         total_executed = 0
-        exec_price = order.price
+        fill_responses = []  # Track individual fills at each price level
 
         if trades:
             # Process trades in pairs (standing, taking)
@@ -408,7 +408,9 @@ class ExchangeServer:
                     )
 
                 total_executed += standing_trade.size
-                exec_price = standing_trade.price
+
+                # Record this fill for the aggressor's response
+                fill_responses.append((standing_trade.size, standing_trade.price))
 
         # Update tracking for the taking order
         remainder = order.size - total_executed
@@ -435,32 +437,41 @@ class ExchangeServer:
                     side=order.side
                 )
 
-        # Generate response
-        if total_executed > 0 and remainder > 0:
-            # Partial fill - part executed, part posted
-            response = OrderHandlerMessage(
-                msg_type=OrderHandlerMessageType.PARTIAL_FILL,
-                order_id=order_id,
-                size=total_executed,
-                price=exec_price,
-                remainder_size=remainder
-            ).serialize()
-            # Also send ACK for the posted portion
-            ack_msg = OrderHandlerMessage(
-                msg_type=OrderHandlerMessageType.ACK,
-                order_id=order_id,
-                size=remainder,
-                price=order.price
-            ).serialize()
-            return response + '\n' + ack_msg
-        elif total_executed > 0:
-            # Fully filled
-            return OrderHandlerMessage(
-                msg_type=OrderHandlerMessageType.FILL,
-                order_id=order_id,
-                size=total_executed,
-                price=exec_price
-            ).serialize()
+        # Generate response - send individual fills at each price level
+        if total_executed > 0:
+            responses = []
+            running_remainder = order.size
+
+            for fill_size, fill_price in fill_responses:
+                running_remainder -= fill_size
+                if running_remainder > 0:
+                    # Partial fill
+                    responses.append(OrderHandlerMessage(
+                        msg_type=OrderHandlerMessageType.PARTIAL_FILL,
+                        order_id=order_id,
+                        size=fill_size,
+                        price=fill_price,
+                        remainder_size=running_remainder
+                    ).serialize())
+                else:
+                    # Final fill (fully filled)
+                    responses.append(OrderHandlerMessage(
+                        msg_type=OrderHandlerMessageType.FILL,
+                        order_id=order_id,
+                        size=fill_size,
+                        price=fill_price
+                    ).serialize())
+
+            # If there's a remainder, also send ACK for the posted portion
+            if remainder > 0:
+                responses.append(OrderHandlerMessage(
+                    msg_type=OrderHandlerMessageType.ACK,
+                    order_id=order_id,
+                    size=remainder,
+                    price=order.price
+                ).serialize())
+
+            return '\n'.join(responses)
         else:
             # Posted to book (no immediate execution)
             return OrderHandlerMessage(

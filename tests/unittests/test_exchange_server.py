@@ -10,7 +10,7 @@ import socket
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from exchange_server import ExchangeServer
-from order_client import OrderClient
+from order_client_with_fsm import OrderClient
 from stp_client import STPClient
 
 

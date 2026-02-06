@@ -63,7 +63,7 @@ from .order_generator import (
 from .tcp_order_handler import TCPOrderHandler
 from .tcp_feed_server import TCPFeedServer
 from .exchange_server import ExchangeServer
-from .order_client import OrderClient
+from .order_client_with_fsm import OrderClient, OrderClientWithFSM
 from .stp_client import STPClient
 
 __all__ = [
@@ -91,5 +91,6 @@ __all__ = [
     'TCPFeedServer',
     'ExchangeServer',
     'OrderClient',
+    'OrderClientWithFSM',
     'STPClient',
 ]

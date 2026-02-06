@@ -309,6 +309,7 @@ class OrderClientWithFSM:
         self._orders: Dict[int, ManagedOrder] = {}
         self._orders_lock = threading.Lock()
         self._pending_order: Optional[ManagedOrder] = None
+        self._pending_event: threading.Event = threading.Event()
         self._message_callback: Optional[Callable[[ManagedOrder, ExchangeMessage], None]] = None
 
     def connect(self) -> bool:
@@ -371,10 +372,24 @@ class OrderClientWithFSM:
             return False
 
     def submit_order_sync(self, order: ManagedOrder, timeout: float = 5.0) -> bool:
-        """Submit order and wait for initial response."""
+        """Submit order and wait for initial response.
+
+        If the async receive thread is running, this waits for it to process
+        the response. Otherwise, it does a synchronous receive.
+        """
+        # Clear the event before submitting
+        self._pending_event.clear()
+
         if not self.submit_order(order):
             return False
 
+        # If async receive is running, wait for it to process the response
+        if self._running and self._receive_thread and self._receive_thread.is_alive():
+            # Wait for the pending order to be resolved by the async thread
+            self._pending_event.wait(timeout=timeout)
+            return order.state != OrderState.PENDING_NEW
+
+        # Fallback to sync receive if async thread isn't running
         try:
             self._socket.settimeout(timeout)
             data = self._socket.recv(4096)
@@ -442,7 +457,7 @@ class OrderClientWithFSM:
                     if line:
                         self._process_message(line)
 
-            except BlockingIOError:
+            except (BlockingIOError, socket.timeout):
                 time.sleep(0.01)
             except Exception as e:
                 if self._running:
@@ -458,20 +473,30 @@ class OrderClientWithFSM:
         order: Optional[ManagedOrder] = None
 
         with self._orders_lock:
-            if msg.msg_type == "ACK" and self._pending_order is not None:
+            # FIRST: Check if this message is for an existing order (passive fill)
+            # This must be checked before pending_order to avoid confusing passive
+            # fills with responses to new orders.
+            if msg.order_id is not None and msg.order_id in self._orders:
+                order = self._orders[msg.order_id]
+
+            # SECOND: Handle responses to pending orders (new order submissions)
+            elif msg.msg_type == "ACK" and self._pending_order is not None:
                 order = self._pending_order
                 self._pending_order = None
+                self._pending_event.set()
                 if msg.order_id is not None:
                     self._orders[msg.order_id] = order
 
             elif msg.msg_type == "REJECT" and self._pending_order is not None:
                 order = self._pending_order
                 self._pending_order = None
+                self._pending_event.set()
 
             elif msg.msg_type == "FILL" and self._pending_order is not None:
-                # Handle immediate full fill for pending order (crossing order)
+                # Immediate full fill for pending order (crossing order)
                 order = self._pending_order
                 self._pending_order = None
+                self._pending_event.set()
                 if msg.order_id is not None:
                     self._orders[msg.order_id] = order
                 # Transition through ACK first, then FILL
@@ -483,9 +508,10 @@ class OrderClientWithFSM:
                 ))
 
             elif msg.msg_type == "PARTIAL_FILL" and self._pending_order is not None:
-                # Handle immediate partial fill for pending order (crossing order)
+                # Immediate partial fill for pending order (crossing order)
                 order = self._pending_order
                 self._pending_order = None
+                self._pending_event.set()
                 if msg.order_id is not None:
                     self._orders[msg.order_id] = order
                 # Transition through ACK first, then PARTIAL_FILL
@@ -495,9 +521,6 @@ class OrderClientWithFSM:
                     size=msg.size,
                     price=msg.price
                 ))
-
-            elif msg.order_id is not None:
-                order = self._orders.get(msg.order_id)
 
         if order is not None:
             order.process_message(msg)
@@ -525,7 +548,7 @@ Price format: price * 10000 (e.g., $5000.00 = 50000000)
 
 def main():
     parser = argparse.ArgumentParser(description='Order Client with FSM')
-    parser.add_argument('--host', default='10.206.79.210')
+    parser.add_argument('--host', default='localhost')
     parser.add_argument('--port', type=int, default=10000)
     parser.add_argument('-q', '--quiet', action='store_true')
     args = parser.parse_args()
@@ -534,9 +557,14 @@ def main():
 
     def on_message(order: ManagedOrder, msg: ExchangeMessage):
         if msg.msg_type in ("FILL", "PARTIAL_FILL") and msg.size and msg.price:
+            side_str = "BUY" if order.side == 'B' else "SELL"
             price_str = f"${msg.price / 10000:.2f}"
             remainder = f", {msg.remainder_size} remaining" if msg.remainder_size else ""
-            print(f"[{msg.msg_type}] Order {order.exchange_order_id}: {msg.size} @ {price_str}{remainder}")
+            print(f"[{msg.msg_type}] Order {order.exchange_order_id}: {side_str} {msg.size} @ {price_str}{remainder}")
+        elif msg.msg_type == "ACK" and msg.size and msg.price:
+            side_str = "BUY" if order.side == 'B' else "SELL"
+            price_str = f"${msg.price / 10000:.2f}"
+            print(f"[{msg.msg_type}] Order {order.exchange_order_id}: {side_str} {msg.size} @ {price_str} ACCEPTED")
         else:
             print(f"[{msg.msg_type}] Order {order.exchange_order_id}: {order.state_name}")
 
@@ -605,6 +633,131 @@ def main():
         pass
     finally:
         client.disconnect()
+
+
+# --- Backwards-compatible OrderClient class ---
+# This provides the simple interface used by tests and older code.
+
+class OrderClient:
+    """
+    Simple order client for sending orders to the exchange.
+
+    This is a backwards-compatible wrapper that provides a simple synchronous
+    interface for tests and scripts that don't need FSM tracking.
+    """
+
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self._socket: Optional[socket.socket] = None
+        self._running = False
+        self._receive_thread: Optional[threading.Thread] = None
+        self._buffer = ""
+
+    def connect(self) -> bool:
+        """Connect to the exchange."""
+        try:
+            self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._socket.connect((self.host, self.port))
+            return True
+        except Exception as e:
+            print(f"Failed to connect: {e}", file=sys.stderr)
+            return False
+
+    def disconnect(self) -> None:
+        """Disconnect from the exchange."""
+        self._running = False
+        if self._receive_thread:
+            self._receive_thread.join(timeout=2.0)
+            self._receive_thread = None
+        if self._socket:
+            try:
+                self._socket.close()
+            except Exception:
+                pass
+            self._socket = None
+
+    def send_order(self, order_str: str, timeout: float = 5.0) -> str:
+        """Send an order synchronously and return the response."""
+        if not self._socket:
+            return "ERROR,Not connected"
+        try:
+            if not order_str.endswith('\n'):
+                order_str += '\n'
+            self._socket.settimeout(timeout)
+            self._socket.sendall(order_str.encode('utf-8'))
+
+            # Receive response
+            response_lines = []
+            self._socket.settimeout(timeout)
+            data = self._socket.recv(4096)
+            self._buffer += data.decode('utf-8')
+
+            while '\n' in self._buffer:
+                line, self._buffer = self._buffer.split('\n', 1)
+                line = line.strip()
+                if line:
+                    response_lines.append(line)
+
+            return '\n'.join(response_lines) if response_lines else ""
+        except socket.timeout:
+            return "ERROR,Timeout"
+        except Exception as e:
+            return f"ERROR,{e}"
+
+    def send_order_async(self, order_str: str) -> bool:
+        """Send an order asynchronously (no wait for response)."""
+        if not self._socket:
+            return False
+        try:
+            if not order_str.endswith('\n'):
+                order_str += '\n'
+            self._socket.sendall(order_str.encode('utf-8'))
+            return True
+        except Exception:
+            return False
+
+    def start_async_receive(self, callback: Optional[Callable[[str], None]] = None) -> None:
+        """Start receiving messages asynchronously."""
+        self._running = True
+        self._receive_thread = threading.Thread(
+            target=self._receive_loop,
+            args=(callback,),
+            daemon=True
+        )
+        self._receive_thread.start()
+
+    def _receive_loop(self, callback: Optional[Callable[[str], None]]) -> None:
+        """Receive loop for async messages."""
+        if not self._socket:
+            return
+        self._socket.setblocking(False)
+
+        while self._running:
+            try:
+                data = self._socket.recv(4096)
+                if not data:
+                    break
+
+                self._buffer += data.decode('utf-8')
+
+                while '\n' in self._buffer:
+                    line, self._buffer = self._buffer.split('\n', 1)
+                    line = line.strip()
+                    if line:
+                        if callback:
+                            callback(line)
+                        else:
+                            print(f"[ASYNC] {line}", flush=True)
+
+            except BlockingIOError:
+                time.sleep(0.01)
+            except socket.timeout:
+                time.sleep(0.01)
+            except Exception as e:
+                if self._running:
+                    print(f"Receive error: {e}", file=sys.stderr)
+                break
 
 
 if __name__ == '__main__':
