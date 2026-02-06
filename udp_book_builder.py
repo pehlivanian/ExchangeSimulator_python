@@ -44,6 +44,46 @@ class BookBuilder:
         self.bid_prices: List[Optional[float]] = []
         self.ask_prices: List[Optional[float]] = []
 
+    def seed_from_orderbook_file(self, orderbook_file: str) -> int:
+        """
+        Seed the order book from a LOBSTER orderbook snapshot file.
+
+        LOBSTER orderbook format (CSV, no header):
+        ask_price_1, ask_size_1, bid_price_1, bid_size_1, ask_price_2, ...
+
+        Args:
+            orderbook_file: Path to the LOBSTER orderbook file
+
+        Returns:
+            Number of price levels seeded
+        """
+        try:
+            with open(orderbook_file, 'r') as f:
+                first_line = f.readline().strip()
+                if not first_line:
+                    return 0
+
+                parts = first_line.split(',')
+                levels_seeded = 0
+
+                # Parse pairs of (ask_price, ask_size, bid_price, bid_size)
+                for i in range(0, len(parts) - 3, 4):
+                    ask_price = int(parts[i])
+                    ask_size = int(parts[i + 1])
+                    bid_price = int(parts[i + 2])
+                    bid_size = int(parts[i + 3])
+
+                    self.book.seed_from_snapshot(
+                        bid_price, bid_size, ask_price, ask_size, time=0.0
+                    )
+                    levels_seeded += 1
+
+                return levels_seeded
+
+        except Exception as e:
+            print(f"Warning: Could not seed order book from {orderbook_file}: {e}")
+            return 0
+
     def process_message(self, lobster_line: str) -> bool:
         """
         Process a LOBSTER format message and update the book.
@@ -236,6 +276,8 @@ def main():
                         help='Save bid/ask plot to PDF file')
     parser.add_argument('--plot-after', type=int, default=0, metavar='N',
                         help='Save plot after N messages (0=at end only)')
+    parser.add_argument('--orderbook', type=str, metavar='FILE',
+                        help='LOBSTER orderbook file to seed initial book state')
     args = parser.parse_args()
 
     # Create UDP socket
@@ -259,6 +301,22 @@ def main():
     # Enable price recording if plotting is requested
     record_prices = args.save_plot is not None
     builder = BookBuilder(record_prices=record_prices)
+
+    # Seed order book from orderbook file if provided
+    if args.orderbook:
+        levels = builder.seed_from_orderbook_file(args.orderbook)
+        if levels > 0:
+            print(f"Seeded order book with {levels} price level(s) from {args.orderbook}")
+            # Record initial BBO if plotting
+            if record_prices:
+                bid = builder.book.get_best_bid_price()
+                ask = builder.book.get_best_ask_price()
+                builder.timestamps.append(0.0)
+                builder.bid_prices.append(bid / 10000.0 if bid else None)
+                builder.ask_prices.append(ask / 10000.0 if ask else None)
+        else:
+            print(f"Warning: No levels seeded from {args.orderbook}")
+
     last_display_count = 0
     plot_saved = False
 

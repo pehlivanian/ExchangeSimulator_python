@@ -827,6 +827,29 @@ class HistoricalReplayServer:
         print()
 
         try:
+            # Seed the order book with initial state from orderbook file
+            if self.orderbook_file:
+                try:
+                    with open(self.orderbook_file, 'r') as f:
+                        first_line = f.readline().strip()
+                        if first_line:
+                            parts = first_line.split(',')
+                            # LOBSTER orderbook format: ask_price1, ask_size1, bid_price1, bid_size1, ...
+                            # For multi-level files, seed all available levels
+                            levels_seeded = 0
+                            for i in range(0, len(parts) - 3, 4):
+                                ask_price = int(parts[i])
+                                ask_size = int(parts[i + 1])
+                                bid_price = int(parts[i + 2])
+                                bid_size = int(parts[i + 3])
+                                self._order_book.seed_from_snapshot(
+                                    bid_price, bid_size, ask_price, ask_size, time=0.0
+                                )
+                                levels_seeded += 1
+                            print(f"Seeded order book with {levels_seeded} level(s) from orderbook file")
+                except Exception as e:
+                    print(f"Warning: Could not seed order book: {e}")
+
             # Wait for subscribers if requested
             if self._market_data_server and wait_subscribers > 0:
                 print(f"Waiting for {wait_subscribers} subscriber(s)...")
