@@ -150,7 +150,7 @@ def stop_server(proc: subprocess.Popen):
         proc.kill()
 
 
-class TestResults:
+class IntegrationResults:
     def __init__(self):
         self.passed = 0
         self.failed = 0
@@ -166,7 +166,7 @@ class TestResults:
             print(f"  ✗ {name}: {details}")
 
 
-def test_basic_orders(results: TestResults):
+def test_basic_orders(results: IntegrationResults):
     """Test basic order submission and ACK using OrderClientWithFSM."""
     print("\n[Test Group 1] Basic Order Operations")
     server = start_server()
@@ -200,7 +200,7 @@ def test_basic_orders(results: TestResults):
         stop_server(server)
 
 
-def test_crossing_orders(results: TestResults):
+def test_crossing_orders(results: IntegrationResults):
     """Test crossing orders generate trades."""
     print("\n[Test Group 2] Crossing Orders and Trades")
     server = start_server()
@@ -248,7 +248,7 @@ def test_crossing_orders(results: TestResults):
         stop_server(server)
 
 
-def test_market_orders(results: TestResults):
+def test_market_orders(results: IntegrationResults):
     """Test market orders."""
     print("\n[Test Group 3] Market Orders")
     server = start_server()
@@ -305,7 +305,7 @@ def wait_for_state(order, expected_state: str, timeout: float = 2.0) -> bool:
     return False
 
 
-def test_cancellation(results: TestResults):
+def test_cancellation(results: IntegrationResults):
     """Test order cancellation."""
     print("\n[Test Group 4] Order Cancellation")
     server = start_server()
@@ -345,7 +345,7 @@ def test_cancellation(results: TestResults):
         stop_server(server)
 
 
-def test_sweep_orders(results: TestResults):
+def test_sweep_orders(results: IntegrationResults):
     """Test orders that sweep multiple price levels."""
     print("\n[Test Group 5] Multi-Level Sweeps")
     server = start_server()
@@ -387,7 +387,7 @@ def test_sweep_orders(results: TestResults):
         stop_server(server)
 
 
-def test_passive_fills(results: TestResults):
+def test_passive_fills(results: IntegrationResults):
     """Test passive fill notifications."""
     print("\n[Test Group 6] Passive Fill Notifications")
     server = start_server()
@@ -426,7 +426,7 @@ def test_passive_fills(results: TestResults):
         stop_server(server)
 
 
-def test_ttl_expiry(results: TestResults):
+def test_ttl_expiry(results: IntegrationResults):
     """Test order TTL expiry."""
     print("\n[Test Group 7] Order TTL Expiry")
     server = start_server()
@@ -462,7 +462,7 @@ def test_ttl_expiry(results: TestResults):
         stop_server(server)
 
 
-def test_partial_fills(results: TestResults):
+def test_partial_fills(results: IntegrationResults):
     """Test partial fills."""
     print("\n[Test Group 8] Partial Fills")
     server = start_server()
@@ -502,7 +502,7 @@ def test_partial_fills(results: TestResults):
         stop_server(server)
 
 
-def test_book_builder_accuracy(results: TestResults):
+def test_book_builder_accuracy(results: IntegrationResults):
     """Test that BookBuilder accurately tracks order book state."""
     print("\n[Test Group 9] Book Builder Accuracy")
     server = start_server()
@@ -540,7 +540,7 @@ def test_book_builder_accuracy(results: TestResults):
         stop_server(server)
 
 
-def test_self_trades(results: TestResults):
+def test_self_trades(results: IntegrationResults):
     """Test self-trade handling - same client submits crossing orders."""
     print("\n[Test Group 10] Self-Trades")
     server = start_server()
@@ -581,7 +581,7 @@ def test_self_trades(results: TestResults):
         stop_server(server)
 
 
-def test_multi_client_fill_reporting(results: TestResults):
+def test_multi_client_fill_reporting(results: IntegrationResults):
     """Test that both maker and taker receive fills with correct details."""
     print("\n[Test Group 11] Multi-Client Fill Reporting")
     server = start_server()
@@ -651,7 +651,7 @@ def test_multi_client_fill_reporting(results: TestResults):
         stop_server(server)
 
 
-def test_cancel_after_partial_fill(results: TestResults):
+def test_cancel_after_partial_fill(results: IntegrationResults):
     """Test cancelling an order that has been partially filled."""
     print("\n[Test Group 12] Cancel After Partial Fill")
     server = start_server()
@@ -694,7 +694,7 @@ def test_cancel_after_partial_fill(results: TestResults):
         stop_server(server)
 
 
-def test_cancel_after_full_fill(results: TestResults):
+def test_cancel_after_full_fill(results: IntegrationResults):
     """Test that cancelling an already-filled order has no effect."""
     print("\n[Test Group 13] Cancel After Full Fill")
     server = start_server()
@@ -735,6 +735,150 @@ def test_cancel_after_full_fill(results: TestResults):
         stop_server(server)
 
 
+def test_modify_order(results: IntegrationResults):
+    """Test order modification (cancel-replace) via OrderClientWithFSM."""
+    print("\n[Test Group 14] Modify Order")
+    server = start_server()
+    udp = UDPBookCollector()
+    try:
+        udp.start()
+        time.sleep(0.2)
+
+        client = OrderClientWithFSM('localhost', 10000)
+        client.connect()
+        client.start_async_receive()
+
+        # Place a bid at $4700.00
+        order = client.create_order("limit", 100, 47000000, "B", 3600)
+        client.submit_order_sync(order)
+        original_id = order.exchange_order_id
+        results.record("Order placed", original_id is not None,
+                       f"exchange_order_id={original_id}")
+
+        udp.clear()
+
+        # Modify price to $4800.00, same size
+        modify_result = client.modify_order(order, size=100, price=48000000)
+        results.record("Modify request sent", modify_result)
+
+        # Wait for the MODIFY_ACK to be processed
+        time.sleep(0.5)
+
+        new_id = order.exchange_order_id
+        results.record("New order ID assigned", new_id is not None and new_id != original_id,
+                       f"old={original_id}, new={new_id}")
+        results.record("Price updated", order.price == 48000000,
+                       f"price={order.price}")
+        results.record("Size preserved", order.size == 100,
+                       f"size={order.size}")
+        results.record("Order still live", order.is_live,
+                       f"state={order.state_name}")
+
+        # Check UDP: should have DELETE (old) + INSERT (new)
+        md = udp.get_summary()
+        results.record("UDP DELETE broadcast for old order", md['deletes'] >= 1,
+                       f"Deletes: {md['deletes']}")
+        results.record("UDP INSERT broadcast for new order", md['inserts'] >= 1,
+                       f"Inserts: {md['inserts']}")
+
+        # Verify we can cancel using the new order ID
+        cancel_result = client.cancel_order(order)
+        time.sleep(0.3)
+        results.record("Cancel modified order succeeded", cancel_result)
+
+        client._running = False
+        client.disconnect()
+
+    finally:
+        udp.stop()
+        stop_server(server)
+
+
+def test_modify_order_size_only(results: IntegrationResults):
+    """Test modifying only the size of an order."""
+    print("\n[Test Group 15] Modify Order - Size Only")
+    server = start_server()
+    try:
+        client = OrderClientWithFSM('localhost', 10000)
+        client.connect()
+        client.start_async_receive()
+
+        # Place an ask at $5100.00
+        order = client.create_order("limit", 50, 51000000, "S", 3600)
+        client.submit_order_sync(order)
+        original_id = order.exchange_order_id
+        original_price = order.price
+
+        # Modify size only (price=0 means keep current)
+        modify_result = client.modify_order(order, size=200, price=0)
+        results.record("Modify size-only sent", modify_result)
+
+        time.sleep(0.5)
+
+        results.record("Size updated to 200", order.size == 200,
+                       f"size={order.size}")
+        results.record("Price unchanged", order.price == original_price,
+                       f"price={order.price}, expected={original_price}")
+        results.record("New ID assigned", order.exchange_order_id != original_id,
+                       f"old={original_id}, new={order.exchange_order_id}")
+
+        client._running = False
+        client.disconnect()
+
+    finally:
+        stop_server(server)
+
+
+def test_modify_crossing_fills(results: IntegrationResults):
+    """Test that modifying to a crossing price results in execution."""
+    print("\n[Test Group 16] Modify Order - Crossing Fill")
+    server = start_server()
+    stp = STPCollector()
+    try:
+        stp.start()
+        time.sleep(0.2)
+
+        # Market maker posts ask at $5000.00
+        mm = OrderClientWithFSM('localhost', 10000)
+        mm.connect()
+        mm.start_async_receive()
+        ask = mm.create_order("limit", 50, 50000000, "S", 3600)
+        mm.submit_order_sync(ask)
+
+        # Buyer posts bid at $4900.00 (no cross)
+        buyer = OrderClientWithFSM('localhost', 10000)
+        buyer.connect()
+        buyer.start_async_receive()
+        bid = buyer.create_order("limit", 100, 49000000, "B", 3600)
+        buyer.submit_order_sync(bid)
+        bid_id = bid.exchange_order_id
+
+        stp.clear()
+
+        # Modify bid up to $5000.00 (crosses the ask)
+        modify_result = buyer.modify_order(bid, size=100, price=50000000)
+        results.record("Modify crossing sent", modify_result)
+
+        time.sleep(0.5)
+
+        # STP should report a trade
+        trades = stp.get_trades()
+        results.record("Trade broadcast on STP", len(trades) >= 1,
+                       f"trades={len(trades)}")
+        if trades:
+            results.record("Trade at correct price", "50000000" in trades[0],
+                           f"trade={trades[0]}")
+
+        mm._running = False
+        mm.disconnect()
+        buyer._running = False
+        buyer.disconnect()
+
+    finally:
+        stp.stop()
+        stop_server(server)
+
+
 def run_tests():
     print("=" * 70)
     print("  INTEGRATION TESTS (using actual components)")
@@ -745,7 +889,7 @@ def run_tests():
     print("    - BookBuilder (udp_book_builder.py)")
     print("=" * 70)
 
-    results = TestResults()
+    results = IntegrationResults()
 
     test_basic_orders(results)
     test_crossing_orders(results)
@@ -760,6 +904,9 @@ def run_tests():
     test_multi_client_fill_reporting(results)
     test_cancel_after_partial_fill(results)
     test_cancel_after_full_fill(results)
+    test_modify_order(results)
+    test_modify_order_size_only(results)
+    test_modify_crossing_fills(results)
 
     print()
     print("=" * 70)

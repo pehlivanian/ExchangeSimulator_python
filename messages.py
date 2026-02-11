@@ -26,6 +26,7 @@ class OrderHandlerMessageType(Enum):
     PARTIAL_FILL = "PARTIAL_FILL"
     REJECT = "REJECT"
     CANCEL_ACK = "CANCEL_ACK"
+    MODIFY_ACK = "MODIFY_ACK"
     EXPIRED = "EXPIRED"
 
 
@@ -95,6 +96,15 @@ class CancelOrder:
 
 
 @dataclass
+class ModifyOrder:
+    """Modify order request from a live client (cancel-replace)."""
+    order_id: int
+    size: int
+    price: int
+    user: str
+
+
+@dataclass
 class OrderHandlerMessage:
     """Message sent back to order handler clients."""
     msg_type: OrderHandlerMessageType
@@ -116,6 +126,8 @@ class OrderHandlerMessage:
             return f"REJECT,{self.reason}"
         elif self.msg_type == OrderHandlerMessageType.CANCEL_ACK:
             return f"CANCEL_ACK,{self.order_id},{self.size}"
+        elif self.msg_type == OrderHandlerMessageType.MODIFY_ACK:
+            return f"MODIFY_ACK,{self.order_id},{self.size},{self.price},{self.remainder_size}"
         elif self.msg_type == OrderHandlerMessageType.EXPIRED:
             return f"EXPIRED,{self.order_id},{self.size}"
         return ""
@@ -196,6 +208,53 @@ def parse_live_order(input_str: str) -> Optional[LiveOrder]:
         user=user,
         ttl=ttl
     )
+
+
+def parse_modify_order(input_str: str) -> Optional[ModifyOrder]:
+    """
+    Parse a modify order string.
+
+    Format: modify,order_id,size,price,user
+    Example: modify,1000,200,50000000,trader1
+    """
+    input_str = input_str.strip()
+    if not input_str:
+        return None
+
+    parts = input_str.split(',')
+    if len(parts) != 5:
+        return None
+
+    order_type = parts[0].strip().lower()
+    if order_type != "modify":
+        return None
+
+    try:
+        order_id = int(parts[1].strip())
+    except ValueError:
+        return None
+
+    try:
+        size = int(parts[2].strip())
+    except ValueError:
+        return None
+
+    if size <= 0:
+        return None
+
+    try:
+        price = int(parts[3].strip())
+    except ValueError:
+        return None
+
+    if price <= 0:
+        return None
+
+    user = parts[4].strip()
+    if not user:
+        return None
+
+    return ModifyOrder(order_id=order_id, size=size, price=price, user=user)
 
 
 def parse_cancel_order(input_str: str) -> Optional[CancelOrder]:

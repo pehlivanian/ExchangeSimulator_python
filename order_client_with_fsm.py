@@ -39,6 +39,7 @@ def parse_exchange_message(message: str) -> Optional[ExchangeMessage]:
         PARTIAL_FILL,{order_id},{size},{price},{remainder_size}
         REJECT,{reason}
         CANCEL_ACK,{order_id},{size}
+        MODIFY_ACK,{old_order_id},{size},{price},{new_order_id}
         EXPIRED,{order_id},{size}
     """
     message = message.strip()
@@ -84,6 +85,14 @@ def parse_exchange_message(message: str) -> Optional[ExchangeMessage]:
                 msg_type=msg_type,
                 order_id=int(parts[1]),
                 size=int(parts[2])
+            )
+        elif msg_type == "MODIFY_ACK" and len(parts) == 5:
+            return ExchangeMessage(
+                msg_type=msg_type,
+                order_id=int(parts[1]),
+                size=int(parts[2]),
+                price=int(parts[3]),
+                remainder_size=int(parts[4])  # new_order_id
             )
         elif msg_type == "EXPIRED" and len(parts) == 3:
             return ExchangeMessage(
@@ -420,6 +429,33 @@ class OrderClientWithFSM:
         except Exception:
             return False
 
+    def modify_order(self, order: ManagedOrder, size: int = 0, price: int = 0,
+                     user: str = "client") -> bool:
+        """
+        Send modify request for a managed order (cancel-replace).
+
+        Args:
+            order: The order to modify
+            size: New size (pass 0 or omit to keep current size)
+            price: New price (pass 0 or omit to keep current price)
+            user: User identifier
+
+        Returns True if the modify request was sent successfully.
+        """
+        if order.exchange_order_id is None or not order.is_live or not self._socket:
+            return False
+
+        # Use current values for unchanged fields
+        new_size = size if size > 0 else order.size
+        new_price = price if price > 0 else order.price
+
+        try:
+            modify_str = f"modify,{order.exchange_order_id},{new_size},{new_price},{user}\n"
+            self._socket.sendall(modify_str.encode('utf-8'))
+            return True
+        except Exception:
+            return False
+
     def get_order(self, exchange_order_id: int) -> Optional[ManagedOrder]:
         """Get order by exchange ID."""
         with self._orders_lock:
@@ -473,10 +509,24 @@ class OrderClientWithFSM:
         order: Optional[ManagedOrder] = None
 
         with self._orders_lock:
+            # Handle MODIFY_ACK: re-map order from old_id to new_id
+            if msg.msg_type == "MODIFY_ACK" and msg.order_id is not None and msg.remainder_size is not None:
+                old_id = msg.order_id
+                new_id = msg.remainder_size
+                if old_id in self._orders:
+                    order = self._orders[old_id]
+                    # Re-map to new exchange order ID
+                    self._orders[new_id] = order
+                    del self._orders[old_id]
+                    # Update the order's internal state
+                    order._fsm._exchange_order_id = new_id
+                    order._size = msg.size
+                    order._price = msg.price
+
             # FIRST: Check if this message is for an existing order (passive fill)
             # This must be checked before pending_order to avoid confusing passive
             # fills with responses to new orders.
-            if msg.order_id is not None and msg.order_id in self._orders:
+            elif msg.order_id is not None and msg.order_id in self._orders:
                 order = self._orders[msg.order_id]
 
             # SECOND: Handle responses to pending orders (new order submissions)
@@ -538,10 +588,12 @@ ORDER_HELP = """
 LIMIT ORDER:  limit,size,price,side[,ttl]
 MARKET ORDER: market,size,side
 CANCEL:       cancel,order_id
+MODIFY:       modify,order_id,size,price
 STATE:        state,order_id
 LIST:         orders
 
 Price format: price * 10000 (e.g., $5000.00 = 50000000)
+Modify: pass new size and price (both required)
 ============================================================
 """
 
@@ -556,7 +608,12 @@ def main():
     client = OrderClientWithFSM(args.host, args.port)
 
     def on_message(order: ManagedOrder, msg: ExchangeMessage):
-        if msg.msg_type in ("FILL", "PARTIAL_FILL") and msg.size and msg.price:
+        if msg.msg_type == "MODIFY_ACK" and msg.size and msg.price and msg.remainder_size:
+            old_id = msg.order_id
+            new_id = msg.remainder_size
+            price_str = f"${msg.price / 10000:.2f}"
+            print(f"[MODIFY_ACK] Order {old_id} -> {new_id}: {msg.size} @ {price_str}")
+        elif msg.msg_type in ("FILL", "PARTIAL_FILL") and msg.size and msg.price:
             side_str = "BUY" if order.side == 'B' else "SELL"
             price_str = f"${msg.price / 10000:.2f}"
             remainder = f", {msg.remainder_size} remaining" if msg.remainder_size else ""
@@ -611,6 +668,16 @@ def main():
                         print(f"Cancel sent")
                     else:
                         print(f"Cancel failed")
+
+                elif cmd == "modify" and len(parts) >= 4:
+                    oid = int(parts[1])
+                    new_size = int(parts[2])
+                    new_price = int(parts[3])
+                    order = client.get_order(oid)
+                    if order and client.modify_order(order, size=new_size, price=new_price):
+                        print(f"Modify sent for order {oid}")
+                    else:
+                        print(f"Modify failed")
 
                 elif cmd == "state" and len(parts) >= 2:
                     order = client.get_order(int(parts[1]))

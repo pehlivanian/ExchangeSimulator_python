@@ -7,10 +7,10 @@ import sys
 # Add parent directory to path for imports
 sys.path.insert(0, '../..')
 
-from test_integration import TestResults
+from test_integration import IntegrationResults
 
 
 @pytest.fixture
 def results():
-    """Provide a TestResults instance for each test."""
-    return TestResults()
+    """Provide a IntegrationResults instance for each test."""
+    return IntegrationResults()

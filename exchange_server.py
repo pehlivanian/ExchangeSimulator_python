@@ -21,11 +21,13 @@ try:
     from .messages import (
         CancelOrder,
         LiveOrder,
+        ModifyOrder,
         OrderHandlerMessage,
         OrderHandlerMessageType,
         STPMessage,
         parse_cancel_order,
         parse_live_order,
+        parse_modify_order,
     )
     from .order_book import OrderBook
     from .order_generator import (
@@ -43,11 +45,13 @@ except ImportError:
     from messages import (
         CancelOrder,
         LiveOrder,
+        ModifyOrder,
         OrderHandlerMessage,
         OrderHandlerMessageType,
         STPMessage,
         parse_cancel_order,
         parse_live_order,
+        parse_modify_order,
     )
     from order_book import OrderBook
     from order_generator import (
@@ -243,6 +247,14 @@ class ExchangeServer:
         cancel_order = parse_cancel_order(order_str)
         if cancel_order is not None:
             response = self._process_cancel_order(conn_id, cancel_order)
+            if self._post_order_callback:
+                self._post_order_callback(order_str, response)
+            return response
+
+        # Try to parse as a modify order
+        modify_order = parse_modify_order(order_str)
+        if modify_order is not None:
+            response = self._process_modify_order(conn_id, modify_order)
             if self._post_order_callback:
                 self._post_order_callback(order_str, response)
             return response
@@ -590,6 +602,155 @@ class ExchangeServer:
             msg_type=OrderHandlerMessageType.CANCEL_ACK,
             order_id=order_id,
             size=cancelled_size
+        ).serialize()
+
+    def _process_modify_order(self, conn_id: int, modify: ModifyOrder) -> str:
+        """
+        Process a modify order request (cancel-replace).
+
+        Deletes the existing order from the book and re-inserts with the new
+        price/size. The order gets a new order_id (loses queue priority).
+        """
+        old_order_id = modify.order_id
+        current_time = get_time_of_day()
+
+        with self._order_remaining_lock:
+            # Check if order exists
+            if old_order_id not in self._order_remaining_size:
+                return OrderHandlerMessage(
+                    msg_type=OrderHandlerMessageType.REJECT,
+                    reason=f"Order {old_order_id} not found"
+                ).serialize()
+
+            # Verify the user owns this order
+            order_user = self._state.get_user(old_order_id)
+            if order_user != modify.user:
+                return OrderHandlerMessage(
+                    msg_type=OrderHandlerMessageType.REJECT,
+                    reason=f"Order {old_order_id} not owned by {modify.user}"
+                ).serialize()
+
+            # Get existing order details
+            side = self._order_side.get(old_order_id)
+            old_price = self._order_price.get(old_order_id)
+            old_expiry = self._order_expiry_time.get(old_order_id)
+
+            if side is None or old_price is None:
+                return OrderHandlerMessage(
+                    msg_type=OrderHandlerMessageType.REJECT,
+                    reason=f"Order {old_order_id} missing side/price info"
+                ).serialize()
+
+            # Compute remaining TTL from original expiry
+            remaining_ttl = old_expiry - time.time() if old_expiry else 3600
+
+            # Delete old order from book
+            delete_event = create_delete_event(
+                self._state,
+                old_order_id,
+                old_price,
+                side
+            )
+            ack, _ = self._order_book.process_event(delete_event)
+
+            if not ack.acked:
+                return OrderHandlerMessage(
+                    msg_type=OrderHandlerMessageType.REJECT,
+                    reason=f"Failed to cancel order {old_order_id} for modify: {ack.reason_rejected}"
+                ).serialize()
+
+            # Remove old tracking
+            self._order_remaining_size.pop(old_order_id, None)
+            self._order_side.pop(old_order_id, None)
+            self._order_price.pop(old_order_id, None)
+            self._order_expiry_time.pop(old_order_id, None)
+
+            # Assign new order ID
+            new_order_id = self._state.get_next_order_id()
+
+            # Record new order ownership (same user, same connection)
+            old_conn_id = self._state.get_connection(old_order_id)
+            self._state.remove_order(old_order_id)
+            self._state.record_order(new_order_id, modify.user, old_conn_id if old_conn_id is not None else conn_id)
+
+            # Track new order
+            self._order_remaining_size[new_order_id] = modify.size
+            self._order_side[new_order_id] = side
+            self._order_price[new_order_id] = modify.price
+            self._order_expiry_time[new_order_id] = time.time() + max(remaining_ttl, 1)
+
+        # Insert new order into book
+        insert_event = create_insert_event(
+            self._state,
+            new_order_id,
+            modify.size,
+            modify.price,
+            side
+        )
+        ack, trades = self._order_book.process_event(insert_event)
+
+        # Handle any immediate trades (if new price crosses)
+        total_executed = 0
+        if trades:
+            for i in range(0, len(trades), 2):
+                standing_trade = trades[i]
+                self._send_passive_fill(standing_trade)
+
+                stp_msg = STPMessage(
+                    size=standing_trade.size,
+                    price=standing_trade.price,
+                    aggressor_side=side
+                )
+                self._feed_server.broadcast(stp_msg.serialize())
+
+                if self._market_data_server:
+                    self._market_data_server.broadcast_execute(
+                        time=current_time,
+                        order_id=standing_trade.order_id,
+                        size=standing_trade.size,
+                        price=standing_trade.price,
+                        side=standing_trade.side
+                    )
+
+                total_executed += standing_trade.size
+
+        # Update tracking after any executions
+        remainder = modify.size - total_executed
+        with self._order_remaining_lock:
+            if remainder <= 0:
+                self._order_remaining_size.pop(new_order_id, None)
+                self._order_side.pop(new_order_id, None)
+                self._order_price.pop(new_order_id, None)
+                self._order_expiry_time.pop(new_order_id, None)
+                self._state.remove_order(new_order_id)
+            else:
+                self._order_remaining_size[new_order_id] = remainder
+
+        # Broadcast market data for the modified order
+        if self._market_data_server:
+            self._market_data_server.broadcast_delete(
+                time=current_time,
+                order_id=old_order_id,
+                size=0,
+                price=old_price,
+                side=side
+            )
+            if remainder > 0:
+                self._market_data_server.broadcast_insert(
+                    time=current_time,
+                    order_id=new_order_id,
+                    size=remainder,
+                    price=modify.price,
+                    side=side
+                )
+
+        # MODIFY_ACK: order_id=old_order_id, remainder_size=new_order_id, size=modify.size, price=modify.price
+        return OrderHandlerMessage(
+            msg_type=OrderHandlerMessageType.MODIFY_ACK,
+            order_id=old_order_id,
+            size=modify.size,
+            price=modify.price,
+            remainder_size=new_order_id
         ).serialize()
 
     def _check_expired_orders(self) -> None:
@@ -969,6 +1130,7 @@ Order formats (live mode):
                                       (e.g., limit,100,50000000,B,trader1,60)
   market,size,0,side,user           - Market order (e.g., market,50,0,S,trader1)
   cancel,order_id,user              - Cancel order (e.g., cancel,1000,trader1)
+  modify,order_id,size,price,user   - Modify order (e.g., modify,1000,200,50000000,trader1)
 
 Price format: price * 10000 (e.g., $5000.00 = 50000000)
 Side: B=Buy, S=Sell
@@ -1072,6 +1234,7 @@ UDP Market Data (default port 10002):
         print("  limit,size,price,side,user[,ttl] - Limit order (TTL in seconds, default: 3600)")
         print("  market,size,0,side,user          - Market order")
         print("  cancel,order_id,user             - Cancel order")
+        print("  modify,order_id,size,price,user  - Modify order (cancel-replace)")
         print()
         print("Price format: price * 10000 (e.g., $5000.00 = 50000000)")
         print("Side: B=Buy, S=Sell")

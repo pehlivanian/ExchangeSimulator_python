@@ -540,6 +540,221 @@ class TestCancelOrders:
         seller.disconnect()
 
 
+class TestModifyOrders:
+    """Tests for order modification (cancel-replace)."""
+
+    @pytest.fixture
+    def server(self):
+        order_port = find_free_port()
+        feed_port = find_free_port()
+        server = ExchangeServer(order_port, feed_port)
+        assert server.start()
+        time.sleep(0.1)
+        yield server, order_port, feed_port
+        server.stop()
+
+    def test_modify_price(self, server):
+        """Modify an order's price."""
+        server_obj, order_port, feed_port = server
+        client = OrderClient('localhost', order_port)
+        assert client.connect()
+
+        # Place a bid
+        response = client.send_order("limit,100,50000000,B,trader1")
+        assert "ACK,1000" in response
+
+        # Modify price upward
+        response = client.send_order("modify,1000,100,51000000,trader1")
+        assert "MODIFY_ACK" in response
+        assert "1000" in response  # old order_id
+        assert "1001" in response  # new order_id
+        assert "51000000" in response  # new price
+
+        client.disconnect()
+
+    def test_modify_size(self, server):
+        """Modify an order's size."""
+        server_obj, order_port, feed_port = server
+        client = OrderClient('localhost', order_port)
+        assert client.connect()
+
+        # Place a bid
+        client.send_order("limit,100,50000000,B,trader1")
+
+        # Modify size
+        response = client.send_order("modify,1000,200,50000000,trader1")
+        assert "MODIFY_ACK" in response
+        assert "200" in response  # new size
+
+        client.disconnect()
+
+    def test_modify_price_and_size(self, server):
+        """Modify both price and size."""
+        server_obj, order_port, feed_port = server
+        client = OrderClient('localhost', order_port)
+        assert client.connect()
+
+        client.send_order("limit,100,50000000,B,trader1")
+
+        response = client.send_order("modify,1000,200,51000000,trader1")
+        assert "MODIFY_ACK" in response
+        assert "200" in response
+        assert "51000000" in response
+
+        client.disconnect()
+
+    def test_modify_updates_book(self, server):
+        """Verify the order book reflects the modify."""
+        server_obj, order_port, feed_port = server
+        client = OrderClient('localhost', order_port)
+        assert client.connect()
+
+        # Place bid at 5000.00
+        client.send_order("limit,100,50000000,B,trader1")
+        bids, asks = server_obj._order_book.get_snapshot()
+        assert len(bids) == 1
+        assert bids[0].price == 50000000
+
+        # Modify to 5100.00
+        client.send_order("modify,1000,100,51000000,trader1")
+        time.sleep(0.1)
+
+        bids, asks = server_obj._order_book.get_snapshot()
+        assert len(bids) == 1
+        assert bids[0].price == 51000000
+
+        client.disconnect()
+
+    def test_modify_nonexistent_order(self, server):
+        """Modify a non-existent order should be rejected."""
+        server_obj, order_port, feed_port = server
+        client = OrderClient('localhost', order_port)
+        assert client.connect()
+
+        response = client.send_order("modify,9999,100,50000000,trader1")
+        assert "REJECT" in response
+        assert "not found" in response.lower()
+
+        client.disconnect()
+
+    def test_modify_wrong_user(self, server):
+        """Modify with wrong user should be rejected."""
+        server_obj, order_port, feed_port = server
+        client = OrderClient('localhost', order_port)
+        assert client.connect()
+
+        client.send_order("limit,100,50000000,B,trader1")
+
+        response = client.send_order("modify,1000,100,51000000,trader2")
+        assert "REJECT" in response
+        assert "not owned" in response.lower()
+
+        client.disconnect()
+
+    def test_modify_already_filled_order(self, server):
+        """Modify a fully filled order should be rejected."""
+        server_obj, order_port, feed_port = server
+
+        seller = OrderClient('localhost', order_port)
+        assert seller.connect()
+        seller.send_order("limit,100,50000000,S,seller")
+        seller.disconnect()
+
+        buyer = OrderClient('localhost', order_port)
+        assert buyer.connect()
+        buyer.send_order("limit,100,50000000,B,buyer")
+        buyer.disconnect()
+
+        # Try to modify the filled sell order
+        client = OrderClient('localhost', order_port)
+        assert client.connect()
+        response = client.send_order("modify,1000,100,51000000,seller")
+        assert "REJECT" in response
+        assert "not found" in response.lower()
+
+        client.disconnect()
+
+    def test_modify_assigns_new_order_id(self, server):
+        """Verify modified order gets a new order ID."""
+        server_obj, order_port, feed_port = server
+        client = OrderClient('localhost', order_port)
+        assert client.connect()
+
+        # Place and modify
+        r1 = client.send_order("limit,100,50000000,B,trader1")
+        assert "ACK,1000" in r1
+
+        r2 = client.send_order("modify,1000,100,51000000,trader1")
+        # MODIFY_ACK,old_id,size,price,new_id
+        parts = r2.strip().split(',')
+        assert parts[0] == "MODIFY_ACK"
+        old_id = int(parts[1])
+        new_id = int(parts[4])
+        assert old_id == 1000
+        assert new_id > old_id
+
+        client.disconnect()
+
+    def test_modify_old_id_no_longer_cancellable(self, server):
+        """After modify, the old order ID should not be cancellable."""
+        server_obj, order_port, feed_port = server
+        client = OrderClient('localhost', order_port)
+        assert client.connect()
+
+        client.send_order("limit,100,50000000,B,trader1")
+        client.send_order("modify,1000,100,51000000,trader1")
+
+        # Try to cancel old ID
+        response = client.send_order("cancel,1000,trader1")
+        assert "REJECT" in response
+
+        client.disconnect()
+
+    def test_modify_new_id_cancellable(self, server):
+        """After modify, the new order ID should be cancellable."""
+        server_obj, order_port, feed_port = server
+        client = OrderClient('localhost', order_port)
+        assert client.connect()
+
+        client.send_order("limit,100,50000000,B,trader1")
+        r = client.send_order("modify,1000,100,51000000,trader1")
+
+        new_id = r.strip().split(',')[4]
+
+        response = client.send_order(f"cancel,{new_id},trader1")
+        assert "CANCEL_ACK" in response
+
+        client.disconnect()
+
+    def test_modify_crossing_price_fills(self, server):
+        """Modify to a crossing price should result in execution."""
+        server_obj, order_port, feed_port = server
+
+        # Post ask at 5000.00
+        seller = OrderClient('localhost', order_port)
+        assert seller.connect()
+        seller.send_order("limit,50,50000000,S,seller")
+        seller.disconnect()
+
+        # Post bid at 4900.00 (no cross)
+        client = OrderClient('localhost', order_port)
+        assert client.connect()
+        client.send_order("limit,100,49000000,B,buyer")
+
+        # Modify bid up to 5000.00 (crosses the ask)
+        response = client.send_order("modify,1001,100,50000000,buyer")
+        assert "MODIFY_ACK" in response
+
+        # The ask should be consumed (book should have no asks at 5000.00)
+        time.sleep(0.1)
+        bids, asks = server_obj._order_book.get_snapshot()
+        # Ask of 50 was filled, bid of 100 modified to 5000.00 should have 50 remaining
+        ask_at_5000 = [a for a in asks if a.price == 50000000]
+        assert len(ask_at_5000) == 0
+
+        client.disconnect()
+
+
 class TestOrderBookDisplay:
     """Tests for order book display functionality."""
 

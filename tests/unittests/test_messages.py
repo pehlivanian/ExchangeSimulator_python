@@ -15,10 +15,12 @@ from messages import (
     EventLOBSTER,
     LiveOrder,
     CancelOrder,
+    ModifyOrder,
     OrderHandlerMessage,
     STPMessage,
     parse_live_order,
     parse_cancel_order,
+    parse_modify_order,
     parse_lobster_line,
 )
 
@@ -243,6 +245,87 @@ class TestOrderHandlerMessage:
             size=100
         )
         assert msg.serialize() == "CANCEL_ACK,1000,100"
+
+
+class TestParseModifyOrder:
+    """Tests for parse_modify_order function."""
+
+    def test_parse_modify(self):
+        result = parse_modify_order("modify,1000,200,50000000,trader1")
+        assert result is not None
+        assert result.order_id == 1000
+        assert result.size == 200
+        assert result.price == 50000000
+        assert result.user == "trader1"
+
+    def test_parse_modify_with_whitespace(self):
+        result = parse_modify_order("  modify , 1000 , 200 , 50000000 , trader1  \n")
+        assert result is not None
+        assert result.order_id == 1000
+        assert result.size == 200
+
+    def test_parse_modify_uppercase(self):
+        result = parse_modify_order("MODIFY,1000,200,50000000,trader1")
+        assert result is not None
+        assert result.order_id == 1000
+
+    def test_invalid_not_modify(self):
+        result = parse_modify_order("cancel,1000,trader1")
+        assert result is None
+
+    def test_invalid_order_id(self):
+        result = parse_modify_order("modify,abc,200,50000000,trader1")
+        assert result is None
+
+    def test_zero_size(self):
+        result = parse_modify_order("modify,1000,0,50000000,trader1")
+        assert result is None
+
+    def test_negative_size(self):
+        result = parse_modify_order("modify,1000,-100,50000000,trader1")
+        assert result is None
+
+    def test_zero_price(self):
+        result = parse_modify_order("modify,1000,200,0,trader1")
+        assert result is None
+
+    def test_negative_price(self):
+        result = parse_modify_order("modify,1000,200,-50000000,trader1")
+        assert result is None
+
+    def test_wrong_field_count(self):
+        result = parse_modify_order("modify,1000,200")
+        assert result is None
+
+    def test_empty_string(self):
+        result = parse_modify_order("")
+        assert result is None
+
+    def test_empty_user(self):
+        result = parse_modify_order("modify,1000,200,50000000,")
+        assert result is None
+
+    def test_non_numeric_size(self):
+        result = parse_modify_order("modify,1000,abc,50000000,trader1")
+        assert result is None
+
+    def test_non_numeric_price(self):
+        result = parse_modify_order("modify,1000,200,abc,trader1")
+        assert result is None
+
+
+class TestModifyAckSerialization:
+    """Tests for MODIFY_ACK message serialization."""
+
+    def test_serialize_modify_ack(self):
+        msg = OrderHandlerMessage(
+            msg_type=OrderHandlerMessageType.MODIFY_ACK,
+            order_id=1000,
+            size=200,
+            price=50000000,
+            remainder_size=1001  # new_order_id
+        )
+        assert msg.serialize() == "MODIFY_ACK,1000,200,50000000,1001"
 
 
 class TestSTPMessage:
