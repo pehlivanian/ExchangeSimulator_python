@@ -540,6 +540,201 @@ def test_book_builder_accuracy(results: TestResults):
         stop_server(server)
 
 
+def test_self_trades(results: TestResults):
+    """Test self-trade handling - same client submits crossing orders."""
+    print("\n[Test Group 10] Self-Trades")
+    server = start_server()
+    try:
+        client = OrderClientWithFSM('localhost', 10000)
+        client.connect()
+        client.start_async_receive()
+
+        # Submit buy order
+        buy_order = client.create_order("limit", 100, 5000000, "B", 3600)
+        client.submit_order_sync(buy_order)
+        results.record("Self-trade: Buy order accepted",
+                       buy_order.state_name == "ACCEPTED",
+                       f"State: {buy_order.state_name}")
+
+        time.sleep(0.1)
+
+        # Submit crossing sell from same client
+        sell_order = client.create_order("limit", 100, 5000000, "S", 3600)
+        client.submit_order_sync(sell_order)
+        time.sleep(0.5)
+
+        # Exchange permits self-trades
+        results.record("Self-trade: Sell order filled",
+                       sell_order.state_name == "FILLED",
+                       f"State: {sell_order.state_name}")
+
+        # Passive buy should also be filled via async notification
+        buy_filled = wait_for_state(buy_order, "FILLED", timeout=2.0)
+        results.record("Self-trade: Buy order filled (passive)",
+                       buy_filled,
+                       f"State: {buy_order.state_name}")
+
+        client._running = False
+        client.disconnect()
+
+    finally:
+        stop_server(server)
+
+
+def test_multi_client_fill_reporting(results: TestResults):
+    """Test that both maker and taker receive fills with correct details."""
+    print("\n[Test Group 11] Multi-Client Fill Reporting")
+    server = start_server()
+    try:
+        # Client A - maker (posts resting bid)
+        clientA = OrderClientWithFSM('localhost', 10000)
+        clientA.connect()
+        clientA.start_async_receive()
+
+        fills_A = []
+
+        def on_msg_A(order, msg):
+            if msg.msg_type in ("FILL", "PARTIAL_FILL"):
+                fills_A.append(msg)
+
+        clientA.set_message_callback(on_msg_A)
+
+        orderA = clientA.create_order("limit", 100, 5000000, "B", 3600)
+        clientA.submit_order_sync(orderA)
+        results.record("MultiClient: Maker order accepted",
+                       orderA.state_name == "ACCEPTED",
+                       f"State: {orderA.state_name}")
+
+        time.sleep(0.2)
+
+        # Client B - taker (crosses with ask)
+        clientB = OrderClientWithFSM('localhost', 10000)
+        clientB.connect()
+        clientB.start_async_receive()
+
+        fills_B = []
+
+        def on_msg_B(order, msg):
+            if msg.msg_type in ("FILL", "PARTIAL_FILL"):
+                fills_B.append(msg)
+
+        clientB.set_message_callback(on_msg_B)
+
+        orderB = clientB.create_order("limit", 100, 5000000, "S", 3600)
+        clientB.submit_order_sync(orderB)
+        time.sleep(0.5)
+
+        # Taker gets fill on submit response
+        results.record("MultiClient: Taker (B) got fill",
+                       len(fills_B) > 0,
+                       f"B fills: {len(fills_B)}")
+
+        # Maker gets passive fill via async
+        results.record("MultiClient: Maker (A) got passive fill",
+                       len(fills_A) > 0,
+                       f"A fills: {len(fills_A)}")
+
+        if fills_A and fills_B:
+            results.record("MultiClient: Same fill price",
+                           fills_A[0].price == fills_B[0].price,
+                           f"A: {fills_A[0].price}, B: {fills_B[0].price}")
+            results.record("MultiClient: Same fill size",
+                           fills_A[0].size == fills_B[0].size,
+                           f"A: {fills_A[0].size}, B: {fills_B[0].size}")
+
+        clientA._running = False
+        clientA.disconnect()
+        clientB._running = False
+        clientB.disconnect()
+
+    finally:
+        stop_server(server)
+
+
+def test_cancel_after_partial_fill(results: TestResults):
+    """Test cancelling an order that has been partially filled."""
+    print("\n[Test Group 12] Cancel After Partial Fill")
+    server = start_server()
+    try:
+        # Place large resting bid
+        maker = OrderClientWithFSM('localhost', 10000)
+        maker.connect()
+        maker.start_async_receive()
+
+        big_order = maker.create_order("limit", 500, 5000000, "B", 3600)
+        maker.submit_order_sync(big_order)
+        results.record("CancelPartial: Large order accepted",
+                       big_order.state_name == "ACCEPTED")
+
+        time.sleep(0.2)
+
+        # Partially fill it with a small sell
+        taker = OrderClientWithFSM('localhost', 10000)
+        taker.connect()
+        small_sell = taker.create_order("limit", 100, 5000000, "S", 3600)
+        taker.submit_order_sync(small_sell)
+        time.sleep(0.5)
+
+        partial = wait_for_state(big_order, "PARTIALLY_FILLED", timeout=2.0)
+        results.record("CancelPartial: Order partially filled", partial,
+                       f"State: {big_order.state_name}")
+
+        # Now cancel the remainder
+        cancel_ok = maker.cancel_order(big_order)
+        cancelled = wait_for_state(big_order, "CANCELLED", timeout=2.0)
+        results.record("CancelPartial: Cancel remainder succeeded",
+                       cancel_ok and cancelled,
+                       f"Cancel sent: {cancel_ok}, State: {big_order.state_name}")
+
+        maker._running = False
+        maker.disconnect()
+        taker.disconnect()
+
+    finally:
+        stop_server(server)
+
+
+def test_cancel_after_full_fill(results: TestResults):
+    """Test that cancelling an already-filled order has no effect."""
+    print("\n[Test Group 13] Cancel After Full Fill")
+    server = start_server()
+    try:
+        client = OrderClientWithFSM('localhost', 10000)
+        client.connect()
+        client.start_async_receive()
+
+        # Post and immediately cross (self-trade)
+        bid = client.create_order("limit", 100, 5000000, "B", 3600)
+        client.submit_order_sync(bid)
+        time.sleep(0.1)
+
+        ask = client.create_order("limit", 100, 5000000, "S", 3600)
+        client.submit_order_sync(ask)
+        time.sleep(0.5)
+
+        filled = wait_for_state(bid, "FILLED", timeout=2.0)
+        results.record("CancelFilled: Order is FILLED", filled,
+                       f"State: {bid.state_name}")
+
+        # Attempt to cancel the filled order
+        cancel_ok = client.cancel_order(bid)
+        time.sleep(0.3)
+
+        # cancel_order returns False because is_live is False for FILLED orders
+        results.record("CancelFilled: cancel_order returns False (not live)",
+                       not cancel_ok,
+                       f"cancel_order returned: {cancel_ok}")
+        results.record("CancelFilled: State remains FILLED",
+                       bid.state_name == "FILLED",
+                       f"State: {bid.state_name}")
+
+        client._running = False
+        client.disconnect()
+
+    finally:
+        stop_server(server)
+
+
 def run_tests():
     print("=" * 70)
     print("  INTEGRATION TESTS (using actual components)")
@@ -561,6 +756,10 @@ def run_tests():
     test_ttl_expiry(results)
     test_partial_fills(results)
     test_book_builder_accuracy(results)
+    test_self_trades(results)
+    test_multi_client_fill_reporting(results)
+    test_cancel_after_partial_fill(results)
+    test_cancel_after_full_fill(results)
 
     print()
     print("=" * 70)
