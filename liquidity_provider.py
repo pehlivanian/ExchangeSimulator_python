@@ -223,7 +223,8 @@ class LiquidityProvider:
         bid = self._book_builder.book.get_best_bid_price()
         ask = self._book_builder.book.get_best_ask_price()
         if bid and ask:
-            return (bid + ask) // 2
+            raw = (bid + ask) // 2
+            return (raw // TICK_SIZE) * TICK_SIZE
         return self._bootstrap_mid
 
     def connect(self) -> bool:
