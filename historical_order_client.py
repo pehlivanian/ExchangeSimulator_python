@@ -7,8 +7,8 @@ order command for the exchange:
   - INSERT (type 1) -> limit order
   - CANCEL (type 2) -> cancel (partial cancel becomes full cancel + new order)
   - DELETE (type 3) -> cancel
-  - EXECUTE (type 4) -> cancel (liquidity taken, remove from book)
-  - HIDDEN (type 5) -> cancel (hidden execution, remove from book)
+  - EXECUTE (type 4) -> market order on aggressor side + reconcile resting order
+  - HIDDEN (type 5) -> same as EXECUTE
 
 Usage:
     python historical_order_client.py <message_file> [--throttle MICROSECONDS]
@@ -57,6 +57,9 @@ class HistoricalOrderClient:
 
         # Immediate fills (orders that matched on insert)
         self.immediate_fills = 0
+
+        # Trades generated from EXECUTE events (market orders sent)
+        self.market_orders_sent = 0
 
     def connect(self) -> bool:
         """Connect to the exchange. Returns True on success."""
@@ -268,53 +271,101 @@ class HistoricalOrderClient:
         """
         Process an EXECUTE event (visible execution).
 
-        The order was executed against, removing liquidity.
-        We send a cancel to remove the liquidity from our book.
-        """
-        if msg.order_id not in self._order_map:
-            self.skipped += 1
-            return False
+        In LOBSTER, an EXECUTE means a resting limit order was hit by an
+        incoming aggressor.  The direction field is the resting order's side,
+        so the aggressor is the opposite side.
 
-        exchange_order_id, old_size, price, side = self._order_map[msg.order_id]
+        We send a market order on the aggressor side for the executed size.
+        The exchange's matching engine will fill whatever is at the top of
+        the book — the original resting order, or another participant (e.g.
+        an Avellaneda-Stoikov market maker) if it is quoting a better price.
+
+        We then reconcile our tracking: if the resting order we knew about
+        was fully consumed, remove it; if partially consumed, update the
+        remaining size.
+        """
+        # Aggressor side is opposite of the resting order's direction
+        # direction=1 (resting buy was hit) → aggressor is Sell
+        # direction=-1 (resting sell was hit) → aggressor is Buy
+        aggressor_side = 'S' if msg.direction == 1 else 'B'
         user = "lobster_replay"
 
-        # Cancel to remove the executed quantity
-        cancel_str = f"cancel,{exchange_order_id},{user}"
-        response = self._send_and_receive(cancel_str)
+        # Send the aggressor market order
+        market_str = f"market,{msg.size},0,{aggressor_side},{user}"
+        response = self._send_and_receive(market_str)
 
-        if not response.startswith('CANCEL_ACK'):
+        # Check for rejection (e.g. empty book)
+        if 'REJECT' in response:
+            if self._verbose_errors:
+                print(f"  EXECUTE market order rejected: {market_str} -> {response}")
             self.errors += 1
             self.execute_errors += 1
-            if self._verbose_errors:
-                print(f"  EXECUTE error: {cancel_str} -> {response}")
-            # Order was likely already filled - remove from tracking
-            del self._order_map[msg.order_id]
+            # Fall back to cancel if market order rejected
+            if msg.order_id in self._order_map:
+                exchange_order_id, old_size, price, side = self._order_map[msg.order_id]
+                cancel_str = f"cancel,{exchange_order_id},{user}"
+                cancel_resp = self._send_and_receive(cancel_str)
+                if cancel_resp.startswith('CANCEL_ACK'):
+                    self.cancels_sent += 1
+                    new_size = old_size - msg.size
+                    if new_size > 0:
+                        resubmit = f"limit,{new_size},{price},{side},{user}"
+                        resp = self._send_and_receive(resubmit)
+                        new_id, was_fill = self._parse_ack_response(resp)
+                        if new_id is not None:
+                            if was_fill:
+                                del self._order_map[msg.order_id]
+                                self.immediate_fills += 1
+                            else:
+                                self._order_map[msg.order_id] = (new_id, new_size, price, side)
+                            self.orders_sent += 1
+                        else:
+                            del self._order_map[msg.order_id]
+                    else:
+                        del self._order_map[msg.order_id]
+                else:
+                    del self._order_map[msg.order_id]
             return False
 
-        self.cancels_sent += 1
+        self.market_orders_sent += 1
 
-        # Calculate remaining size after execution
-        new_size = old_size - msg.size
-
-        if new_size > 0:
-            # Re-submit with remaining size
-            order_str = f"limit,{new_size},{price},{side},{user}"
-            response = self._send_and_receive(order_str)
-
-            new_exchange_id, was_fill = self._parse_ack_response(response)
-            if new_exchange_id is not None:
-                if was_fill:
-                    # Immediately filled - don't track
-                    del self._order_map[msg.order_id]
-                    self.immediate_fills += 1
-                else:
-                    self._order_map[msg.order_id] = (new_exchange_id, new_size, price, side)
-                self.orders_sent += 1
-            else:
+        # Reconcile tracking for the resting order we knew about.
+        # The market order may have filled the original resting order,
+        # or it may have filled someone else (e.g. AS market maker) first.
+        # Either way, update our tracking based on the LOBSTER data which
+        # tells us the original order lost msg.size shares.
+        if msg.order_id in self._order_map:
+            exchange_order_id, old_size, price, side = self._order_map[msg.order_id]
+            new_size = old_size - msg.size
+            if new_size <= 0:
+                # Fully consumed — cancel any remainder from exchange
+                cancel_str = f"cancel,{exchange_order_id},{user}"
+                resp = self._send_and_receive(cancel_str)
+                if resp.startswith('CANCEL_ACK'):
+                    self.cancels_sent += 1
                 del self._order_map[msg.order_id]
-                self.errors += 1
-        else:
-            del self._order_map[msg.order_id]
+            else:
+                # Partially consumed — cancel and resubmit with new size
+                cancel_str = f"cancel,{exchange_order_id},{user}"
+                resp = self._send_and_receive(cancel_str)
+                if resp.startswith('CANCEL_ACK'):
+                    self.cancels_sent += 1
+                    resubmit = f"limit,{new_size},{price},{side},{user}"
+                    resp = self._send_and_receive(resubmit)
+                    new_id, was_fill = self._parse_ack_response(resp)
+                    if new_id is not None:
+                        if was_fill:
+                            del self._order_map[msg.order_id]
+                            self.immediate_fills += 1
+                        else:
+                            self._order_map[msg.order_id] = (new_id, new_size, price, side)
+                        self.orders_sent += 1
+                    else:
+                        del self._order_map[msg.order_id]
+                        self.errors += 1
+                else:
+                    # Order was already filled by the market order we sent
+                    del self._order_map[msg.order_id]
 
         return True
 
@@ -359,8 +410,8 @@ LOBSTER Event Types:
   1 = INSERT   -> Submit limit order
   2 = CANCEL   -> Cancel + resubmit with reduced size
   3 = DELETE   -> Cancel order
-  4 = EXECUTE  -> Cancel (liquidity taken)
-  5 = HIDDEN   -> Cancel (hidden execution)
+  4 = EXECUTE  -> Market order on aggressor side + reconcile resting order
+  5 = HIDDEN   -> Same as EXECUTE
   7 = HALT     -> Skip
 
 Example:
@@ -457,6 +508,7 @@ Example:
     print("=" * 70)
     print(f"  Messages processed: {message_count}")
     print(f"  Orders sent:        {client.orders_sent}")
+    print(f"  Market orders sent: {client.market_orders_sent}")
     print(f"  Immediate fills:    {client.immediate_fills}")
     print(f"  Cancels sent:       {client.cancels_sent}")
     print(f"  Errors:             {client.errors}")

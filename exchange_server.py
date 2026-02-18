@@ -237,6 +237,23 @@ class ExchangeServer:
                 logger.info(f"Connected clients - Orders: {order_clients}, Feed: {feed_clients}")
                 last_log_time = current_time
 
+    # Validation constants
+    MIN_PRICE = 20000       # $2.00 in LOBSTER format (price * 10000)
+    MAX_SIZE = 999999       # Maximum order size
+
+    def _validate_order(self, price: int, size: int) -> Optional[str]:
+        """
+        Validate order price and size. Returns a rejection reason string,
+        or None if the order is valid.
+        """
+        if price < self.MIN_PRICE:
+            return f"Price {price} below minimum (${self.MIN_PRICE / 10000:.2f})"
+        if size > self.MAX_SIZE:
+            return f"Size {size} exceeds maximum ({self.MAX_SIZE})"
+        if size > price:
+            return f"Possible fat-finger: size ({size}) > price ({price}), fields may be swapped"
+        return None
+
     def _process_order(self, conn_id: int, order_str: str) -> str:
         """
         Process an incoming order and return the response.
@@ -254,6 +271,15 @@ class ExchangeServer:
         # Try to parse as a modify order
         modify_order = parse_modify_order(order_str)
         if modify_order is not None:
+            rejection = self._validate_order(modify_order.price, modify_order.size)
+            if rejection:
+                response = OrderHandlerMessage(
+                    msg_type=OrderHandlerMessageType.REJECT,
+                    reason=rejection
+                ).serialize()
+                if self._post_order_callback:
+                    self._post_order_callback(order_str, response)
+                return response
             response = self._process_modify_order(conn_id, modify_order)
             if self._post_order_callback:
                 self._post_order_callback(order_str, response)
@@ -269,6 +295,18 @@ class ExchangeServer:
             if self._post_order_callback:
                 self._post_order_callback(order_str, response)
             return response
+
+        # Validate price and size for limit orders
+        if live_order.order_type == "limit":
+            rejection = self._validate_order(live_order.price, live_order.size)
+            if rejection:
+                response = OrderHandlerMessage(
+                    msg_type=OrderHandlerMessageType.REJECT,
+                    reason=rejection
+                ).serialize()
+                if self._post_order_callback:
+                    self._post_order_callback(order_str, response)
+                return response
 
         # Process based on order type
         if live_order.order_type == "market":
@@ -288,6 +326,7 @@ class ExchangeServer:
         remainder = order.size
         total_executed = 0
         fill_responses = []  # Track fills at each price level
+        current_time = get_time_of_day()
 
         # Walk the opposite side until filled or no liquidity
         while remainder > 0:
@@ -327,6 +366,16 @@ class ExchangeServer:
                         aggressor_side=order.side
                     )
                     self._feed_server.broadcast(stp_msg.serialize())
+
+                    # Broadcast EXECUTE on UDP market data
+                    if self._market_data_server:
+                        self._market_data_server.broadcast_execute(
+                            time=current_time,
+                            order_id=trade.order_id,
+                            size=trade.size,
+                            price=trade.price,
+                            side=trade.side
+                        )
 
             # Record fill at this price level
             fill_responses.append(
@@ -805,6 +854,17 @@ class ExchangeServer:
             # Get connection ID for sending expiry notification
             conn_id = self._state.get_connection(order_id)
             self._state.remove_order(order_id)
+
+        # Broadcast DELETE on UDP market data so book builders see the expiry
+        if self._market_data_server:
+            current_time = get_time_of_day()
+            self._market_data_server.broadcast_delete(
+                time=current_time,
+                order_id=order_id,
+                size=expired_size,
+                price=price,
+                side=side
+            )
 
         # Send EXPIRED message to client (outside lock)
         msg = OrderHandlerMessage(
