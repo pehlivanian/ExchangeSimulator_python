@@ -1,6 +1,6 @@
 # Exchange Simulator
 
-A multi-threaded exchange simulator with price-time priority matching, supporting live trading and LOBSTER historical data replay.
+A multi-threaded exchange simulator with price-time priority matching, supporting live trading, LOBSTER historical data replay, and NASDAQ ITCH 5.0 historical data replay.
 
 ## Quick Start
 
@@ -28,7 +28,7 @@ print(f'Order {order.exchange_order_id}: {order.state_name}')
 client.disconnect()
 ```
 
-### Historical Replay Mode
+### Historical Replay Mode (LOBSTER — built into the server)
 
 **Terminal 1:** Start server with LOBSTER data
 ```bash
@@ -48,7 +48,7 @@ Then press Enter in Terminal 1 to start replay.
 **Note:** Use `--wait-ready` or `--wait-subscribers N` so clients can connect before replay starts.
 
 
-### Liquidity Provider Replay Mode
+### LOBSTER Client Replay Mode
 
 In this mode, a client replays LOBSTER data as orders to a live exchange server. This simulates a liquidity provider feeding orders into the market.
 
@@ -61,14 +61,132 @@ python exchange_server.py -v
 python udp_book_builder.py --levels 5
 ```
 
-**Terminal 3:** Start historical order client to replay LOBSTER data
+**Terminal 3:** Start LOBSTER client to replay data
 ```bash
-python historical_order_client.py AMZN_2012-06-21_34200000_57600000_message_1.csv \
+python historical_LOBSTER_client.py AMZN_2012-06-21_34200000_57600000_message_1.csv \
     --throttle 10000
 ```
 
 -- Will there be any trading activity in this case? Fire up the stp_client.py and find out.
 
+
+### ITCH 5.0 Client Replay Mode
+
+`historical_ITCH_client.py` reads a NASDAQ TotalView-ITCH 5.0 HDF5 file (produced by `create_ITCH_HDF5_store.py`) and replays every order-book event for a single stock through the live exchange server. The exchange book mirrors the real ITCH book tick-by-tick, so a strategy running in parallel can interact with genuine NASDAQ order flow.
+
+#### Basic replay — all messages for one stock
+
+**Terminal 1:** Start exchange server with market data
+```bash
+python exchange_server.py --market-data-port 10002
+```
+
+**Terminal 2 (optional):** Watch the order book
+```bash
+python udp_book_builder.py --levels 10
+```
+
+**Terminal 3:** Replay AAPL for the full day
+```bash
+python historical_ITCH_client.py \
+    --hdf5 data/itch.h5 \
+    --ticker AAPL
+```
+
+#### Market-hours only with progress output
+
+```bash
+python historical_ITCH_client.py \
+    --hdf5 data/itch.h5\
+    --ticker AAPL \
+    --start-time 09:30:00 \
+    --end-time   16:00:00 \
+    --print-every 25000
+```
+
+#### Throttled replay (100 µs between messages)
+
+Useful when running alongside a strategy that needs time to react:
+```bash
+python historical_ITCH_client.py \
+    --hdf5 data/itch.h5 \
+    --ticker AAPL \
+    --start-time 09:30:00 \
+    --end-time   16:00:00 \
+    --throttle 100
+```
+
+#### Replay with book diagnostics
+
+**Terminal 1:**
+```bash
+python exchange_server.py --market-data-port 10002
+```
+
+**Terminal 2:**
+```bash
+python udp_book_builder.py --levels 20 --update-every 500 \
+    --diagnostics aapl_report.json --plot-book-shape aapl_shape.pdf
+```
+
+**Terminal 3:**
+```bash
+python historical_ITCH_client.py \
+    --hdf5 data/itch.h5 \
+    --ticker AAPL \
+    --start-time 09:30:00 \
+    --end-time   16:00:00 \
+    --print-every 50000
+```
+
+After the replay finishes, Ctrl+C the book builder to write the report and plot.
+
+#### Running alongside the Avellaneda-Stoikov market maker
+
+**Terminal 1:**
+```bash
+python exchange_server.py --market-data-port 10002
+```
+
+**Terminal 2:** Book builder for observation
+```bash
+python udp_book_builder.py --levels 10 --update-every 100
+```
+
+**Terminal 3:** ITCH replay drives the order book
+```bash
+python historical_ITCH_client.py \
+    --hdf5 data/itch.h5 \
+    --ticker AAPL \
+    --start-time 09:30:00 \
+    --end-time   16:00:00 \
+    --throttle 500
+```
+
+**Terminal 4:** AS market maker quotes against real NASDAQ flow
+```bash
+python avellaneda_stoikov.py --gamma 0.1 --order-size 100 -v
+```
+
+#### Verbose per-message output (debugging)
+
+```bash
+python historical_ITCH_client.py \
+    --hdf5 data/itch.h5 \
+    --ticker AAPL \
+    --start-time 09:30:00 \
+    --max-messages 5000 \
+    --verbose \
+    --verbose-errors
+```
+
+#### Select stock by NASDAQ locator integer instead of ticker
+
+```bash
+python historical_ITCH_client.py \
+    --hdf5 data/itch.h5 \
+    --locate 7421
+```
 
 
 ### Stylized-Facts Liquidity Provider with Order Book Diagnostics
@@ -96,7 +214,7 @@ Let it run for a while, then Ctrl+C all three. On exit the book builder writes:
 - `lob_shape.pdf` — horizontal bar chart of average bid/ask depth by level
 - A human-readable summary printed to stdout
 
-The same workflow works with `historical_order_client.py` in place of the liquidity provider:
+The same workflow works with `historical_LOBSTER_client.py` in place of the liquidity provider:
 
 **Terminal 1:** Start exchange server
 ```bash
@@ -111,7 +229,7 @@ python udp_book_builder.py --levels 20 --update-every 10 \
 
 **Terminal 3:** Replay LOBSTER data as live orders
 ```bash
-python historical_order_client.py AMZN_2012-06-21_34200000_57600000_message_1.csv \
+python historical_LOBSTER_client.py AMZN_2012-06-21_34200000_57600000_message_1.csv \
     --throttle 10000
 ```
 
@@ -177,9 +295,37 @@ The central order book and matching engine. Accepts orders and broadcasts market
 | `--no-validate` | Disable orderbook validation |
 | `--wait-subscribers N` | Wait for N market data subscribers before starting |
 
-### historical_order_client.py
+### historical_ITCH_client.py
 
-Replays LOBSTER data as live orders.
+Replays NASDAQ TotalView-ITCH 5.0 data from an HDF5 file as live orders to the exchange server. Each ITCH message type is translated to the appropriate exchange operation:
+
+| ITCH type | Action |
+|-----------|--------|
+| `/A`, `/F` | Submit limit order; track in order map |
+| `/D` | Cancel resting order |
+| `/X` | Partial cancel: cancel + resubmit with reduced size |
+| `/E`, printable `/C` | Send market order (aggressor side) so the tape event is broadcast; reconcile resting order size |
+| non-printable `/C` | Silently shrink resting order (no tape print) |
+| `/U` | Cancel original order; submit replacement at new price/size (side preserved) |
+| `/P` | Synthetic limit + market pair for hidden-order tape prints |
+
+| Option | Description |
+|--------|-------------|
+| `--hdf5 FILE` | Path to ITCH HDF5 file (required) |
+| `--ticker SYMBOL` | Stock ticker, e.g. `AAPL` (mutually exclusive with `--locate`) |
+| `--locate N` | NASDAQ stock locator integer (alternative to `--ticker`) |
+| `--host HOST` | Exchange host (default: localhost) |
+| `--port PORT` | Exchange TCP order port (default: 10000) |
+| `--start-time HH:MM:SS` | Skip messages before this time |
+| `--end-time HH:MM:SS` | Stop after this time |
+| `--throttle MICROSECONDS` | Sleep between messages in µs (default: 0) |
+| `--max-messages N` | Stop after N messages |
+| `-v, --verbose` | Print each message as processed |
+| `--verbose-errors` | Print full error details |
+
+### historical_LOBSTER_client.py
+
+Replays LOBSTER data as live orders to the exchange server.
 
 | Option | Description |
 |--------|-------------|
@@ -304,15 +450,21 @@ The exchange rejects orders that fail any of the following checks:
 
 Validation applies to new limit orders and modify orders. Market orders are exempt (they carry price=0 by design). Rejected orders receive a `REJECT` message with a descriptive reason.
 
-## LOBSTER Data
+## Data Sources
+
+### LOBSTER Data
 
 Download sample data from [LOBSTER](https://lobsterdata.com/). Files needed:
-- `*_message_*.csv` - Order events (time, type, id, size, price, direction)
-- `*_orderbook_*.csv` - Book snapshots (ask1, size1, bid1, size1, ...)
+- `*_message_*.csv` — Order events (time, type, id, size, price, direction)
+- `*_orderbook_*.csv` — Book snapshots (ask1, size1, bid1, size1, ...)
+
+### NASDAQ ITCH 5.0 Data
+
+ITCH data is stored in HDF5 format with one table per message type (`/A`, `/F`, `/D`, `/E`, `/C`, `/X`, `/U`, `/P`), indexed by `stock_locate`. Use `create_ITCH_HDF5_store.py` (or the accompanying notebook) to convert a raw ITCH binary file to the HDF5 store. The file is passed to `historical_ITCH_client.py` via `--hdf5`.
 
 ## Tests
 
-Note: The AMZN_*_message_* and AMZN_*_orderbook_* files must be present or 
+Note: The AMZN_*_message_* and AMZN_*_orderbook_* files must be present or
       accessible (symlinked) from the unittests directory for some of the tests.
 
 ```bash

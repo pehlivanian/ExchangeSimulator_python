@@ -134,7 +134,7 @@ class ExchangeServer:
         lines.append("│              ORDER BOOK SNAPSHOT                │")
         lines.append("├─────────────────────────────────────────────────┤")
         lines.append("│      BIDS (Buy)      │      ASKS (Sell)         │")
-        lines.append("│   Price    │  Size   │   Price    │  Size      │")
+        lines.append("│   Price    │  Size   │   Price    │  Size       │")
         lines.append("├──────────────────────┼──────────────────────────┤")
 
         max_rows = max(min(len(bids), levels), min(len(asks), levels))
@@ -146,7 +146,7 @@ class ExchangeServer:
             if i < len(bids):
                 bid_price = bids[i].price / 10000.0
                 bid_size = bids[i].size
-                line += f"{bid_price:9.2f} │ {bid_size:7d} │ "
+                line += f"{bid_price:9.2f}  │ {bid_size:7d} │ "
             else:
                 line += "          │         │ "
 
@@ -154,7 +154,7 @@ class ExchangeServer:
             if i < len(asks):
                 ask_price = asks[i].price / 10000.0
                 ask_size = asks[i].size
-                line += f"{ask_price:9.2f} │ {ask_size:7d}    │"
+                line += f"{ask_price:9.2f}  │ {ask_size:7d}     │"
             else:
                 line += "          │            │"
 

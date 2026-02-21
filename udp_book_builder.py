@@ -56,6 +56,13 @@ class DiagnosticsCollector:
         self._last_ts = None
         self._event_count = 0
 
+        # time-series / trade data for plotting
+        self._ts_times: List[float] = []
+        self._ts_bids: List[float] = []
+        self._ts_asks: List[float] = []
+        self._trade_times: List[float] = []
+        self._trade_prices: List[float] = []
+
     # --- public API (called from main thread) ---
 
     def start(self):
@@ -115,6 +122,17 @@ class DiagnosticsCollector:
         if bid_price is not None and ask_price is not None:
             spread = (ask_price - bid_price) / 10000.0
             self._spreads.append(spread)
+
+        # BBO time series — sample every 50 events to bound memory
+        if self._event_count % 50 == 0 and bid_price is not None and ask_price is not None:
+            self._ts_times.append(timestamp)
+            self._ts_bids.append(bid_price / 10000.0)
+            self._ts_asks.append(ask_price / 10000.0)
+
+        # Trade prices — record every execution
+        if event_type_str == 'EXECUTE':
+            self._trade_times.append(timestamp)
+            self._trade_prices.append(price / 10000.0)
 
         # book shape snapshot (sample every 500 events to bound memory)
         if self._event_count % 500 == 0 and (bids_snap or asks_snap):
@@ -283,6 +301,125 @@ class DiagnosticsCollector:
         print(f"Book shape plot saved to {filename}")
         return True
 
+    def plot_diagnostics(self, filename: str, max_levels: int = 0) -> bool:
+        """Generate a 3-panel diagnostics figure and save to *filename*.
+
+        Panels
+        ------
+        Top (full width):  Bid / Ask prices and trade executions vs time.
+        Bottom-left:       Historical distribution of bid and ask prices.
+        Bottom-right:      Average book shape (depth by level).
+        """
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.gridspec as gridspec
+            import matplotlib.ticker as ticker
+        except ImportError:
+            print("Error: matplotlib is required for plotting. "
+                  "Install with: pip install matplotlib")
+            return False
+
+        has_ts = bool(self._ts_times)
+        report = self._build_report()
+        shape = report.get("average_book_shape")
+
+        if not has_ts and shape is None:
+            print("No diagnostics data to plot (need at least 50 events).")
+            return False
+
+        fig = plt.figure(figsize=(14, 10))
+        gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.42, wspace=0.35)
+
+        ax_ts    = fig.add_subplot(gs[0, :])   # top row — full width
+        ax_dist  = fig.add_subplot(gs[1, 0])   # bottom-left
+        ax_shape = fig.add_subplot(gs[1, 1])   # bottom-right
+
+        # ── Panel 1: Bid / Ask / Trades vs Time ──────────────────────────────
+        if has_ts:
+            t0 = self._ts_times[0]
+            ts_rel = [t - t0 for t in self._ts_times]
+
+            ax_ts.plot(ts_rel, self._ts_bids, color='#2196F3', linewidth=0.8,
+                       alpha=0.85, label='Bid')
+            ax_ts.plot(ts_rel, self._ts_asks, color='#F44336', linewidth=0.8,
+                       alpha=0.85, label='Ask')
+
+            if self._trade_times:
+                trade_rel = [t - t0 for t in self._trade_times]
+                ax_ts.scatter(trade_rel, self._trade_prices, s=10,
+                              color='#4CAF50', alpha=0.7, zorder=5,
+                              label=f'Trades ({len(self._trade_prices):,})')
+
+            ax_ts.set_xlabel('Time (seconds from first event)')
+            ax_ts.set_ylabel('Price ($)')
+            ax_ts.set_title('Bid / Ask / Trades vs Time')
+            ax_ts.legend(loc='best', fontsize=9)
+            ax_ts.grid(True, alpha=0.3)
+        else:
+            ax_ts.text(0.5, 0.5, 'No time-series data\n(need ≥50 events)',
+                       ha='center', va='center', transform=ax_ts.transAxes,
+                       fontsize=11)
+            ax_ts.set_title('Bid / Ask / Trades vs Time')
+
+        # ── Panel 2: Historical distribution of bid and ask prices ───────────
+        if has_ts:
+            all_prices = self._ts_bids + self._ts_asks
+            price_range = max(all_prices) - min(all_prices)
+            # aim for ~$0.01 bins; cap between 20 and 200 bins
+            bins = max(20, min(200, int(price_range / 0.01) + 1))
+
+            ax_dist.hist(self._ts_bids, bins=bins, color='#2196F3', alpha=0.55,
+                         label='Bid', density=True)
+            ax_dist.hist(self._ts_asks, bins=bins, color='#F44336', alpha=0.55,
+                         label='Ask', density=True)
+            ax_dist.set_xlabel('Price ($)')
+            ax_dist.set_ylabel('Density')
+            ax_dist.set_title('Historical Distribution of Bids & Offers')
+            ax_dist.legend(loc='best', fontsize=9)
+            ax_dist.grid(True, alpha=0.3)
+        else:
+            ax_dist.text(0.5, 0.5, 'No price data', ha='center', va='center',
+                         transform=ax_dist.transAxes, fontsize=11)
+            ax_dist.set_title('Historical Distribution of Bids & Offers')
+
+        # ── Panel 3: Average book shape ───────────────────────────────────────
+        if shape:
+            bid_levels = shape["bids"] if max_levels == 0 else shape["bids"][:max_levels]
+            ask_levels = shape["asks"] if max_levels == 0 else shape["asks"][:max_levels]
+            max_lvls   = max(len(bid_levels), len(ask_levels))
+
+            y_pos      = list(range(max_lvls))
+            bid_sizes  = [bid_levels[i]["avg_size"] if i < len(bid_levels) else 0
+                          for i in range(max_lvls)]
+            ask_sizes  = [ask_levels[i]["avg_size"] if i < len(ask_levels) else 0
+                          for i in range(max_lvls)]
+
+            ax_shape.barh(y_pos, [-s for s in bid_sizes], color='#2196F3',
+                          alpha=0.8, label='Bids')
+            ax_shape.barh(y_pos, ask_sizes, color='#F44336',
+                          alpha=0.8, label='Asks')
+            ax_shape.set_ylabel('Level (0 = best)')
+            ax_shape.set_xlabel('Average Size')
+            ax_shape.set_title(f'Avg Book Shape ({shape["num_snapshots"]} snapshots)')
+            ax_shape.set_yticks(y_pos)
+            ax_shape.set_yticklabels([f'L{i}' for i in y_pos])
+            ax_shape.invert_yaxis()
+            ax_shape.legend(loc='best', fontsize=9)
+            ax_shape.grid(True, alpha=0.3, axis='x')
+            ax_shape.xaxis.set_major_formatter(
+                ticker.FuncFormatter(lambda x, _: f'{abs(x):.0f}'))
+        else:
+            ax_shape.text(0.5, 0.5, 'No book-shape data\n(need ≥500 events)',
+                          ha='center', va='center', transform=ax_shape.transAxes,
+                          fontsize=11)
+            ax_shape.set_title('Average Book Shape')
+
+        fig.suptitle('Order Book Diagnostics', fontsize=14, fontweight='bold')
+        plt.savefig(filename, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Diagnostics plot saved to {filename}")
+        return True
+
 
 # ---------------------------------------------------------------------------
 # BookBuilder (unchanged except for process_message return value)
@@ -442,7 +579,7 @@ class BookBuilder:
         lines.append("│              ORDER BOOK                         │")
         lines.append("├─────────────────────────────────────────────────┤")
         lines.append("│      BIDS (Buy)      │      ASKS (Sell)         │")
-        lines.append("│   Price    │  Size   │   Price    │  Size      │")
+        lines.append("│   Price    │  Size   │   Price    │  Size       │")
         lines.append("├──────────────────────┼──────────────────────────┤")
 
         max_rows = max(min(len(bids), levels), min(len(asks), levels))
@@ -455,16 +592,16 @@ class BookBuilder:
                 if i < len(bids):
                     bid_price = bids[i].price / 10000.0
                     bid_size = bids[i].size
-                    line += f"{bid_price:9.2f} │ {bid_size:7d} │ "
+                    line += f"{bid_price:9.2f}  │ {bid_size:7d} │ "
                 else:
-                    line += "          │         │ "
+                    line += "           │         │ "
 
                 if i < len(asks):
                     ask_price = asks[i].price / 10000.0
                     ask_size = asks[i].size
-                    line += f"{ask_price:9.2f} │ {ask_size:7d}    │"
+                    line += f"{ask_price:9.2f}  │  {ask_size:7d}    │"
                 else:
-                    line += "          │            │"
+                    line += "           │             │"
 
                 lines.append(line)
 
@@ -547,12 +684,17 @@ def main():
                         help='Enable microstructure diagnostics; write JSON report to FILE on exit')
     parser.add_argument('--plot-book-shape', type=str, metavar='FILE',
                         help='Save average book shape plot to FILE (requires --diagnostics)')
+    parser.add_argument('--plot-diagnostics', type=str, metavar='FILE',
+                        help='Save 3-panel diagnostics plot (time series, distribution, book shape)'
+                             ' to FILE (requires --diagnostics)')
     parser.add_argument('--max-shape-levels', type=int, default=0, metavar='N',
                         help='Max levels in book shape plot (0=all, default: 0)')
     args = parser.parse_args()
 
     if args.plot_book_shape and not args.diagnostics:
         parser.error('--plot-book-shape requires --diagnostics')
+    if args.plot_diagnostics and not args.diagnostics:
+        parser.error('--plot-diagnostics requires --diagnostics')
 
     # Create UDP socket
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -640,6 +782,9 @@ def main():
             if args.plot_book_shape:
                 diag.plot_book_shape(args.plot_book_shape,
                                      max_levels=args.max_shape_levels)
+            if args.plot_diagnostics:
+                diag.plot_diagnostics(args.plot_diagnostics,
+                                      max_levels=args.max_shape_levels)
         sock.close()
 
 

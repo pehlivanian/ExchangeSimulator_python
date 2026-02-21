@@ -155,7 +155,7 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
     """
 
     def __init__(self, host='localhost', order_port=10000, md_port=10002,
-                 gamma=0.01, k=20.0, k_auto=False, horizon=300.0,
+                 gamma=0.01, k=20.0, k_auto=False, k_min=5.0, horizon=300.0,
                  sigma_window=100,
                  max_inventory=500, order_size=100, min_requote=0.1,
                  warmup=5.0,
@@ -200,7 +200,7 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
         self._k_window_start = 0.0          # start of current counting window
         self._k_window_sec = 5.0            # window length in seconds
         self._k_ema_alpha = 0.3             # EMA smoothing factor
-        self._k_min = 5.0                   # floor to avoid divide-by-zero spreads
+        self._k_min = k_min                 # floor to avoid divide-by-zero spreads
 
         # Time-series
         self._snapshots: List[Snapshot] = []
@@ -349,16 +349,17 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
         bid_d = r - spread / 2.0
         ask_d = r + spread / 2.0
 
-        # Market reference prices
+        # Market reference prices (always tick-aligned integers from the book)
         mkt_bid = (bbo.bid_price / PRICE_SCALE) if bbo.bid_price else s - tick_d
         mkt_ask = (bbo.ask_price / PRICE_SCALE) if bbo.ask_price else s + tick_d
 
-        # MARKET-MAKER INVARIANT: always buy at or below the market bid,
-        # always sell at or above the market ask.  This guarantees we earn
-        # (never pay) the spread on every fill.  The AS reservation-price
-        # shift handles inventory skew naturally — when long r < s so the
-        # bid pulls further from market (fewer buys), and when short r > s
-        # so the ask pulls further from market (fewer sells).
+        # MARKET-MAKER INVARIANT: never bid above the market bid, never offer
+        # below the market ask.  Using mkt_bid/mkt_ask (tick-aligned) rather
+        # than the mid-price is critical: the mid is halfway between ticks,
+        # so clamping to it produces a half-tick value.  Python's banker's
+        # rounding then causes bid_price to stick for every other 1-tick
+        # market move, making our quotes appear frozen.  Clamping to the
+        # tick-aligned mkt_bid/mkt_ask avoids this rounding artifact entirely.
         bid_d = min(bid_d, mkt_bid)
         ask_d = max(ask_d, mkt_ask)
 
@@ -422,9 +423,11 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
                 self._bid_order = None
             elif self._bid_order.price != bid_price or self._bid_order.size != bid_size:
                 # Atomic modify — no window for stale fills
-                self.modify_order(self._bid_order, size=bid_size, price=bid_price,
-                                  user="client")
-                quote_bid = False   # modify keeps the order live
+                if not self.modify_order(self._bid_order, size=bid_size, price=bid_price,
+                                         user="client"):
+                    self._bid_order = None  # modify failed; re-submit below
+                else:
+                    quote_bid = False   # modify sent; order still live
             else:
                 quote_bid = False   # already correct
         if quote_bid and (self._bid_order is None or not self._bid_order.is_live):
@@ -442,9 +445,11 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
                 self._ask_order = None
             elif self._ask_order.price != ask_price or self._ask_order.size != ask_size:
                 # Atomic modify — no window for stale fills
-                self.modify_order(self._ask_order, size=ask_size, price=ask_price,
-                                  user="client")
-                quote_ask = False
+                if not self.modify_order(self._ask_order, size=ask_size, price=ask_price,
+                                         user="client"):
+                    self._ask_order = None  # modify failed; re-submit below
+                else:
+                    quote_ask = False   # modify sent; order still live
             else:
                 quote_ask = False
         if quote_ask and (self._ask_order is None or not self._ask_order.is_live):
@@ -568,7 +573,8 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
 
     def run(self) -> None:
         print(f"Avellaneda-Stoikov Market Maker")
-        k_str = f"k={self._k} (auto)" if self._k_auto else f"k={self._k}"
+        k_str = (f"k={self._k} (auto, min={self._k_min})" if self._k_auto
+                 else f"k={self._k}")
         print(f"  gamma={self._gamma}  {k_str}  horizon={self._horizon}s")
         print(f"  order_size={self._order_size}  max_inventory={self._max_inventory}")
         print(f"  sigma_window={self._sigma_window}  min_requote={self._min_requote}s  warmup={self._warmup}s")
@@ -777,10 +783,18 @@ def main():
     parser.add_argument('--gamma', type=float, default=0.01,
                         help='Risk aversion parameter (default: 0.01)')
     parser.add_argument('--k', type=float, default=20.0,
-                        help='Order arrival intensity (default: 20.0)')
+                        help='Order arrival intensity κ.  The liquidity term of the '
+                             'spread is ≈2/κ, so κ directly sets your minimum quote '
+                             'width.  Illiquid instruments need κ~20; highly liquid '
+                             'ones (e.g. MSFT, AMZN) need κ~200-500. (default: 20.0)')
     parser.add_argument('--k-auto', action='store_true',
-                        help='Dynamically estimate k from observed trade rate '
-                             '(--k value becomes the initial estimate)')
+                        help='Dynamically estimate k from observed message rate '
+                             '(recommended for liquid instruments). '
+                             '--k becomes the initial estimate; --k-min sets the floor.')
+    parser.add_argument('--k-min', type=float, default=5.0,
+                        help='Minimum k when using --k-auto (default: 5.0). '
+                             'Set to ~100 for liquid stocks to prevent the spread '
+                             'from widening excessively before k-auto converges.')
     parser.add_argument('--horizon', type=float, default=300.0,
                         help='Time horizon T in seconds (default: 300)')
     parser.add_argument('--sigma-window', type=int, default=100,
@@ -833,6 +847,7 @@ def main():
         gamma=args.gamma,
         k=args.k,
         k_auto=args.k_auto,
+        k_min=args.k_min,
         horizon=args.horizon,
         sigma_window=args.sigma_window,
         max_inventory=args.max_inventory,
