@@ -43,7 +43,6 @@ Usage
     client.start()
 """
 
-import argparse
 import socket
 import sys
 import threading
@@ -312,52 +311,72 @@ class OrderClientWithFSMAndMarketData(OrderClientWithFSM):
 # ======================================================================
 
 class PeggedOrderClient(OrderClientWithFSMAndMarketData):
-    """
-    Assignment 1: Pegged Order
-    --------------------------
-    Implement a pegged order that tracks the BBO.
-
-    A pegged buy order should always rest at the current best bid price.
-    A pegged sell order should always rest at the current best ask price.
-
-    When the BBO changes:
-      1. Cancel the existing order
-      2. Re-submit at the new best price
-      3. Handle edge cases (empty book, order already filled, etc.)
-
-    Hints:
-      - Use self.cancel_order(order) to cancel
-      - Use self.create_order() and self.submit_order_sync() to place new orders
-      - self._pegged_order tracks your current live order
-      - Check order.is_live before cancelling
-      - Consider: what if your cancel is too slow and you get filled?
-    """
 
     def __init__(self, host='localhost', order_port=10000, md_port=10002,
-                 side: str = 'B', size: int = 100):
+                 side: str = 'B', size: int = 100, offset: int = 0):
         super().__init__(host, order_port, md_port)
         self._peg_side = side.upper()
         self._peg_size = size
+        self._peg_offset = offset
         self._pegged_order: Optional[ManagedOrder] = None
 
+    def _target_price(self) -> Optional[int]:
+        if self._peg_side == 'B':
+            levels = self.get_bid_levels(depth=2)
+        else:
+            levels = self.get_ask_levels(depth=2)
+        if not levels:
+            return None
+
+        my_price = (self._pegged_order.price
+                    if self._pegged_order and self._pegged_order.is_live else None)
+        filtered = [lvl for lvl in levels
+                    if not (my_price is not None
+                            and lvl.price == my_price
+                            and lvl.order_count == 1)]
+        if not filtered:
+            return None
+
+        ref = filtered[0].price
+        dollars = self._peg_offset * 100
+        return ref - dollars if self._peg_side == 'B' else ref + dollars
+
+    def _try_place_or_repeg(self, new_bbo: Optional[BBO] = None) -> None:
+        """
+        Core placement / repeg logic. Called from on_bbo_change (for repeg)
+        and on_market_data (for initial placement when BBO hasn't changed but
+        book depth has changed enough to satisfy the offset).
+        """
+        target_price = self._target_price()
+        if target_price is None:
+            return
+
+        if self._pegged_order is None or not self._pegged_order.is_live:
+            order = self.create_order("limit", self._peg_size, target_price, self._peg_side)
+            if self.submit_order_sync(order):
+                self._pegged_order = order
+            return
+
+        if self._pegged_order.price != target_price:
+            self.modify_order(self._pegged_order, price=target_price)
+
+        if new_bbo is not None:
+            o = self._pegged_order
+            peg_str = (f"order {o.exchange_order_id} @ ${o.price / 10000:.4f}"
+                       if o and o.exchange_order_id else "no peg order")
+            print(f"BBO: {new_bbo}  |  {peg_str}")
+
     def on_bbo_change(self, old_bbo: BBO, new_bbo: BBO) -> None:
-        """
-        TODO: Student implements pegged order logic here.
+        breakpoint()
+        self._try_place_or_repeg(new_bbo)
 
-        When the BBO changes, you should:
-          1. Determine the new target price based on self._peg_side
-             - For a buy peg: target_price = new_bbo.bid_price
-             - For a sell peg: target_price = new_bbo.ask_price
-          2. If we have an existing live order at a different price, cancel it
-          3. Submit a new limit order at the target price
-          4. Store the new order in self._pegged_order
-
-        Edge cases to handle:
-          - new_bbo has no bid or no ask (empty side)
-          - cancel fails (order may have been filled)
-          - order already at the correct price (no action needed)
-        """
-        pass  # TODO: Student implements this
+    def on_market_data(self, lobster_line: str) -> None:
+        # When no pegged order is live yet, check on every market data event.
+        # This is needed because the BBO may not change when deeper levels are
+        # added (e.g., placing the 2nd and 3rd bid levels doesn't move the
+        # best bid), yet the book depth may now satisfy the offset requirement.
+        if self._pegged_order is None or not self._pegged_order.is_live:
+            self._try_place_or_repeg()
 
 
 class ProRataClient(OrderClientWithFSMAndMarketData):
@@ -426,142 +445,32 @@ class ProRataClient(OrderClientWithFSMAndMarketData):
 # ======================================================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Order Client with FSM + Market Data'
-    )
-    parser.add_argument('--host', default='localhost')
-    parser.add_argument('--order-port', type=int, default=10000)
-    parser.add_argument('--md-port', type=int, default=10002)
-    parser.add_argument('-q', '--quiet', action='store_true')
-    args = parser.parse_args()
+    client = PeggedOrderClient(offset=1)
 
-    # --- Use a simple demo subclass that prints BBO changes ---
-
-    class DemoClient(OrderClientWithFSMAndMarketData):
-        def on_bbo_change(self, old_bbo, new_bbo):
-            print(f"[BBO] {new_bbo}")
-
-        def on_market_data(self, lobster_line):
-            pass  # quiet — override to see raw messages
-
-    client = DemoClient(
-        host=args.host,
-        order_port=args.order_port,
-        md_port=args.md_port,
-    )
-
-    def on_order_message(order: ManagedOrder, msg: ExchangeMessage):
-        if msg.msg_type in ("FILL", "PARTIAL_FILL") and msg.size and msg.price:
+    def on_message(order: ManagedOrder, msg: ExchangeMessage) -> None:
+        if msg.msg_type == "MODIFY_ACK" and msg.price and msg.remainder_size:
+            print(f"  [MODIFY_ACK] {msg.order_id} -> {msg.remainder_size} @ ${msg.price / 10000:.4f}")
+        elif msg.msg_type in ("FILL", "PARTIAL_FILL") and msg.size and msg.price:
             side_str = "BUY" if order.side == 'B' else "SELL"
-            price_str = f"${msg.price / 10000:.2f}"
-            remainder = f", {msg.remainder_size} remaining" if msg.remainder_size else ""
-            print(f"[{msg.msg_type}] Order {order.exchange_order_id}: "
-                  f"{side_str} {msg.size} @ {price_str}{remainder}")
-        elif msg.msg_type == "ACK" and msg.size and msg.price:
-            side_str = "BUY" if order.side == 'B' else "SELL"
-            price_str = f"${msg.price / 10000:.2f}"
-            print(f"[{msg.msg_type}] Order {order.exchange_order_id}: "
-                  f"{side_str} {msg.size} @ {price_str} ACCEPTED")
+            rem = f", {msg.remainder_size} rem" if msg.remainder_size else ""
+            print(f"  [{msg.msg_type}] {side_str} {msg.size} @ ${msg.price / 10000:.4f}{rem}")
+        elif msg.msg_type == "ACK" and msg.price:
+            print(f"  [ACK] order {order.exchange_order_id} @ ${msg.price / 10000:.4f}")
         else:
-            print(f"[{msg.msg_type}] Order {order.exchange_order_id}: {order.state_name}")
+            print(f"  [{msg.msg_type}] order {order.exchange_order_id}: {order.state_name}")
 
-    client.set_message_callback(on_order_message)
+    client.set_message_callback(on_message)
 
     if not client.connect():
+        print("Failed to connect", file=sys.stderr)
         sys.exit(1)
 
+    print("Pegged BUY 100 @ BBO+0  (Ctrl+C to stop)")
     client.start()
 
-    HELP = """
-============================================================
-  ORDER CLIENT WITH FSM + MARKET DATA
-============================================================
-
-LIMIT ORDER:  limit,size,price,side[,ttl]
-MARKET ORDER: market,size,side
-CANCEL:       cancel,order_id
-STATE:        state,order_id
-LIST:         orders
-BBO:          bbo
-BOOK:         book[,depth]
-
-Price format: price * 10000 (e.g., $500.00 = 5000000)
-============================================================
-"""
-
-    if not args.quiet:
-        print(HELP)
-
     try:
-        for line in sys.stdin:
-            line = line.strip()
-            if not line:
-                continue
-
-            parts = line.split(',')
-            cmd = parts[0].lower()
-
-            try:
-                if cmd == "limit" and len(parts) >= 4:
-                    size, price, side = int(parts[1]), int(parts[2]), parts[3].upper()
-                    ttl = int(parts[4]) if len(parts) > 4 else DEFAULT_TTL_SECONDS
-                    order = client.create_order("limit", size, price, side, ttl)
-                    if client.submit_order_sync(order):
-                        print(f"Submitted: {order}")
-                    else:
-                        print(f"Failed: {order.error_message}")
-
-                elif cmd == "market" and len(parts) >= 3:
-                    size, side = int(parts[1]), parts[2].upper()
-                    order = client.create_order("market", size, 0, side)
-                    if client.submit_order_sync(order):
-                        print(f"Submitted: {order}")
-                    else:
-                        print(f"Failed: {order.error_message}")
-
-                elif cmd == "cancel" and len(parts) >= 2:
-                    order = client.get_order(int(parts[1]))
-                    if order and client.cancel_order(order):
-                        print("Cancel sent")
-                    else:
-                        print("Cancel failed")
-
-                elif cmd == "state" and len(parts) >= 2:
-                    order = client.get_order(int(parts[1]))
-                    if order:
-                        print(f"{order}\n  History: "
-                              f"{[(s.name, e.name) for s, e in order.state_history]}")
-                    else:
-                        print("Not found")
-
-                elif cmd == "orders":
-                    for oid, order in client.get_all_orders().items():
-                        print(f"  {oid}: {order.state_name}")
-
-                elif cmd == "bbo":
-                    print(client.get_bbo())
-
-                elif cmd == "book":
-                    depth = int(parts[1]) if len(parts) > 1 else 5
-                    bids, asks = client.get_snapshot(depth)
-                    print("\n  BIDS:")
-                    for lvl in bids:
-                        print(f"    ${lvl.price / 10000:.2f}  x {lvl.size:>8}  "
-                              f"({lvl.order_count} orders)")
-                    print("  ASKS:")
-                    for lvl in asks:
-                        print(f"    ${lvl.price / 10000:.2f}  x {lvl.size:>8}  "
-                              f"({lvl.order_count} orders)")
-                    if not bids and not asks:
-                        print("  (empty book)")
-                    print()
-
-                else:
-                    print(f"Unknown: {line}")
-
-            except (ValueError, IndexError) as e:
-                print(f"Error: {e}")
-
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
         pass
     finally:

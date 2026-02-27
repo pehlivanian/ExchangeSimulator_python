@@ -740,6 +740,7 @@ class ExchangeServer:
 
         # Handle any immediate trades (if new price crosses)
         total_executed = 0
+        fill_records = []  # (size, price) for taker fill notifications
         if trades:
             for i in range(0, len(trades), 2):
                 standing_trade = trades[i]
@@ -762,6 +763,7 @@ class ExchangeServer:
                     )
 
                 total_executed += standing_trade.size
+                fill_records.append((standing_trade.size, standing_trade.price))
 
         # Update tracking after any executions
         remainder = modify.size - total_executed
@@ -793,14 +795,44 @@ class ExchangeServer:
                     side=side
                 )
 
-        # MODIFY_ACK: order_id=old_order_id, remainder_size=new_order_id, size=modify.size, price=modify.price
-        return OrderHandlerMessage(
+        # Always send MODIFY_ACK first so the client remaps its order ID.
+        modify_ack = OrderHandlerMessage(
             msg_type=OrderHandlerMessageType.MODIFY_ACK,
             order_id=old_order_id,
             size=modify.size,
             price=modify.price,
             remainder_size=new_order_id
         ).serialize()
+
+        if not fill_records:
+            return modify_ack
+
+        # The modify crossed and filled immediately.  Notify the taker (the
+        # client that sent the modify) with FILL/PARTIAL_FILL messages keyed
+        # on new_order_id, exactly as _process_limit_order does for crossing
+        # limit orders.  Without this the client's FSM stays in ACCEPTED and
+        # it creates a ghost order that silently absorbs every subsequent
+        # modify attempt.
+        responses = [modify_ack]
+        running_remainder = modify.size
+        for fill_size, fill_price in fill_records:
+            running_remainder -= fill_size
+            if running_remainder > 0:
+                responses.append(OrderHandlerMessage(
+                    msg_type=OrderHandlerMessageType.PARTIAL_FILL,
+                    order_id=new_order_id,
+                    size=fill_size,
+                    price=fill_price,
+                    remainder_size=running_remainder
+                ).serialize())
+            else:
+                responses.append(OrderHandlerMessage(
+                    msg_type=OrderHandlerMessageType.FILL,
+                    order_id=new_order_id,
+                    size=fill_size,
+                    price=fill_price
+                ).serialize())
+        return '\n'.join(responses)
 
     def _check_expired_orders(self) -> None:
         """Check for and expire any orders past their TTL."""

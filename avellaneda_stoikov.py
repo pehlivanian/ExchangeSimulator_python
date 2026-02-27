@@ -100,12 +100,19 @@ class OFISignal(Signal):
         if self._regime == 0:
             return 0.0
         delta_ms = (self._now - self._regime_start) * 1000.0
-        delta_ms = max(delta_ms, 0.001)  # avoid zero
-        delta_ms = min(delta_ms, self._max_delta_ms)
+        if delta_ms >= self._max_delta_ms:
+            return 0.0   # signal fully decayed
+        delta_ms = max(delta_ms, 0.0)
+        # Remaining alpha = cumulative move still ahead: F(max) - F(now)
+        # where F(h) = a * h^b is the markout-regression cumulative price move.
         if self._regime == 1:
-            return self._a_top * (delta_ms ** self._b_top) * 1e-4
+            remaining = (self._max_delta_ms ** self._b_top
+                         - delta_ms ** self._b_top)
+            return self._a_top * remaining * 1e-4
         else:
-            return self._a_bot * (delta_ms ** self._b_bot) * 1e-4
+            remaining = (self._max_delta_ms ** self._b_bot
+                         - delta_ms ** self._b_bot)
+            return self._a_bot * remaining * 1e-4
 
     def __repr__(self):
         return (f"OFISignal(top=({self._a_top}, {self._b_top}), "
@@ -160,6 +167,7 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
                  max_inventory=500, order_size=100, min_requote=0.1,
                  warmup=5.0,
                  verbose=False, output='as_market_maker.pdf',
+                 plot_alpha: bool = False, price_margin: float = 0.05,
                  signals: Optional[List[Signal]] = None):
         super().__init__(host, order_port, md_port)
 
@@ -175,6 +183,8 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
         self._warmup = warmup
         self._verbose = verbose
         self._output = output
+        self._plot_alpha = plot_alpha
+        self._price_margin = price_margin
 
         # State — protected by _state_lock for cross-thread access
         self._state_lock = threading.Lock()
@@ -222,6 +232,27 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
         mid_d = new_bbo.mid_price / PRICE_SCALE
         now = time.time()
 
+        # Quote protection: if the market has moved so that our standing quote
+        # now crosses the opposite side, cancel immediately rather than waiting
+        # for the next requote cycle.  This is the primary defence against fills
+        # at worse-than-opposite-side prices.  cancel_order() is fire-and-forget
+        # so it is safe to call here from the MD callback thread.
+        if (new_bbo.ask_price is not None
+                and self._bid_order is not None and self._bid_order.is_live
+                and self._bid_order.price >= new_bbo.ask_price):
+            if self._verbose:
+                print(f"[PROTECT] bid ${self._bid_order.price/PRICE_SCALE:.2f}"
+                      f" >= ask ${new_bbo.ask_price/PRICE_SCALE:.2f} — cancelling")
+            self.cancel_order(self._bid_order)
+
+        if (new_bbo.bid_price is not None
+                and self._ask_order is not None and self._ask_order.is_live
+                and self._ask_order.price <= new_bbo.bid_price):
+            if self._verbose:
+                print(f"[PROTECT] ask ${self._ask_order.price/PRICE_SCALE:.2f}"
+                      f" <= bid ${new_bbo.bid_price/PRICE_SCALE:.2f} — cancelling")
+            self.cancel_order(self._ask_order)
+
         # Sample mid for sigma at fixed intervals to filter microstructure noise
         if now - self._last_sigma_sample_time >= self._sigma_sample_interval:
             self._last_sigma_sample_time = now
@@ -245,11 +276,9 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
     # ------------------------------------------------------------------
 
     def on_market_data(self, lobster_line: str) -> None:
-        """Estimate k from total market data message rate.
+        """Hook called for every raw LOBSTER line from the market-data feed.
 
-        Total message rate (inserts + cancels + executes) is a better proxy
-        for market activity than executes alone.  A market producing 200
-        messages/s is far more liquid than one producing 20 messages/s.
+        Estimates k from total message rate when --k-auto is enabled.
         """
         if not self._k_auto:
             return
@@ -349,23 +378,30 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
         bid_d = r - spread / 2.0
         ask_d = r + spread / 2.0
 
-        # Market reference prices (always tick-aligned integers from the book)
+        # Clamp quotes to the current BBO: never improve on the best bid or ask.
+        # Using tick-aligned integers from the book avoids banker's-rounding
+        # artifacts that occur when clamping to the half-tick mid price.
         mkt_bid = (bbo.bid_price / PRICE_SCALE) if bbo.bid_price else s - tick_d
         mkt_ask = (bbo.ask_price / PRICE_SCALE) if bbo.ask_price else s + tick_d
 
-        # MARKET-MAKER INVARIANT: never bid above the market bid, never offer
-        # below the market ask.  Using mkt_bid/mkt_ask (tick-aligned) rather
-        # than the mid-price is critical: the mid is halfway between ticks,
-        # so clamping to it produces a half-tick value.  Python's banker's
-        # rounding then causes bid_price to stick for every other 1-tick
-        # market move, making our quotes appear frozen.  Clamping to the
-        # tick-aligned mkt_bid/mkt_ask avoids this rounding artifact entirely.
+        # Clamp to the current BBO: never place inside the spread.
+        # Using mkt_bid/mkt_ask (not mid) ensures we are always passive —
+        # our bid joins or trails the best bid, our ask joins or trails the
+        # best ask.  Clamping to mid instead lets us quote inside the spread,
+        # making us the first target for aggressive orders and dramatically
+        # increasing adverse selection.
         bid_d = min(bid_d, mkt_bid)
         ask_d = max(ask_d, mkt_ask)
 
-        # Convert to LOBSTER and snap to tick grid
-        bid_price = int(round(bid_d * PRICE_SCALE / TICK_SIZE)) * TICK_SIZE
-        ask_price = int(round(ask_d * PRICE_SCALE / TICK_SIZE)) * TICK_SIZE
+        # Convert to LOBSTER and snap to tick grid.
+        # Use directed rounding: floor bids, ceiling asks.  This is critical
+        # when mid_price is a half-tick (e.g. 100.005): Python's banker's
+        # round(10000.5) = 10000 would produce ask_price = market_bid, creating
+        # a crossing order that fills immediately at below-mid price.
+        # A small epsilon absorbs float-representation noise for on-tick values.
+        _eps = 1e-9
+        bid_price = int(bid_d * PRICE_SCALE / TICK_SIZE + _eps) * TICK_SIZE
+        ask_price = math.ceil(ask_d * PRICE_SCALE / TICK_SIZE - _eps) * TICK_SIZE
 
         # Final sanity: bid and ask must be positive and bid < ask
         if bid_price <= 0:
@@ -654,7 +690,8 @@ class AvellanedaStoikov(OrderClientWithFSMAndMarketData):
                 snapshots = list(self._snapshots)
                 fills = list(self._fills)
             if snapshots:
-                plot_results(snapshots, fills, self._output)
+                plot_results(snapshots, fills, self._output,
+                             self._plot_alpha, self._price_margin)
             else:
                 print("No data recorded — nothing to plot.")
 
@@ -688,7 +725,9 @@ def _downsample(snapshots: List[Snapshot], bin_sec: float = 0.25) -> List[Snapsh
 
 
 def plot_results(snapshots: List[Snapshot], fills: List[FillRecord],
-                 out_file: str = 'as_market_maker.pdf') -> None:
+                 out_file: str = 'as_market_maker.pdf',
+                 plot_alpha: bool = False,
+                 price_margin: float = 0.05) -> None:
     try:
         import matplotlib
         matplotlib.use('Agg')
@@ -739,14 +778,20 @@ def plot_results(snapshots: List[Snapshot], fills: List[FillRecord],
     ax.legend(loc='upper left', fontsize=7, ncol=3)
     ax.grid(True, alpha=0.3)
 
-    # Alpha signal overlay (secondary y-axis)
-    alpha_vals = [s.alpha for s in sampled]
-    if any(a != 0.0 for a in alpha_vals):
-        ax2 = ax.twinx()
-        ax2.plot(ts, alpha_vals, linewidth=0.6, color='purple', alpha=0.6, label='Alpha ($)')
-        ax2.set_ylabel('Alpha ($)', color='purple')
-        ax2.tick_params(axis='y', labelcolor='purple')
-        ax2.legend(loc='upper right', fontsize=7)
+    # Clamp y-axis to BBO range + margin so deep quotes don't compress the view
+    bbo_lo = min(bid)
+    bbo_hi = max(ask)
+    ax.set_ylim(bbo_lo - price_margin, bbo_hi + price_margin)
+
+    # Alpha signal overlay (secondary y-axis) — opt-in via plot_alpha
+    if plot_alpha:
+        alpha_vals = [s.alpha for s in sampled]
+        if any(a != 0.0 for a in alpha_vals):
+            ax2 = ax.twinx()
+            ax2.plot(ts, alpha_vals, linewidth=0.6, color='purple', alpha=0.6, label='Alpha ($)')
+            ax2.set_ylabel('Alpha ($)', color='purple')
+            ax2.tick_params(axis='y', labelcolor='purple')
+            ax2.legend(loc='upper right', fontsize=7)
 
     # --- Panel 2: Inventory ---
     ax = axes[1]
@@ -811,6 +856,12 @@ def main():
                         help='Print quote updates and fills')
     parser.add_argument('-o', '--output', type=str, default='as_market_maker.pdf',
                         help='Output plot filename (default: as_market_maker.pdf)')
+    parser.add_argument('--plot-alpha', action='store_true', default=False,
+                        help='Overlay alpha signal on price panel (default: off)')
+    parser.add_argument('--price-margin', type=float, default=0.05, metavar='DOLLARS',
+                        help='Y-axis margin above/below market BBO in price panel '
+                             '(default: 0.05). Clips far-off quotes to zoom in on '
+                             'quoting action near the spread.')
 
     # Signal arguments
     parser.add_argument('--signal', type=str, default=None, choices=['ofi'],
@@ -839,7 +890,6 @@ def main():
             bot_edge=args.ofi_bot_edge,
             max_delta_ms=args.ofi_max_delta,
         ))
-
     mm = AvellanedaStoikov(
         host=args.host,
         order_port=args.order_port,
@@ -856,6 +906,8 @@ def main():
         warmup=args.warmup,
         verbose=args.verbose,
         output=args.output,
+        plot_alpha=args.plot_alpha,
+        price_margin=args.price_margin,
         signals=signals,
     )
 

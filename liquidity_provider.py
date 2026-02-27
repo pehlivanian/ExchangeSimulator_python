@@ -12,7 +12,8 @@ volatility and makes price dynamics emergent rather than imposed.
 
 Stylized facts implemented:
   1. Power-law limit order placement:  P(delta) ~ (delta + delta1)^{-mu}, mu ~ 0.6
-  2. Power-law order sizes:            P(V > x) ~ x^{-1-alpha}, alpha ~ 1.5
+  2. Mixed order-size distribution:    ~75 % round lots (100-share multiples, Pareto on lot
+                                       count); ~25 % odd lots (lognormal, median ≈ 40 shares)
   3. Long memory in order flow:        sign autocorrelation C(tau) ~ tau^{-beta}, beta ~ 0.6
   4. Distance-dependent cancellation:  exponential TTL ~ base * exp(growth * delta)
 
@@ -49,10 +50,15 @@ MU = 0.6
 DELTA1 = 1          # offset in ticks so delta=0 is valid
 MAX_DELTA_TICKS = 200
 
-# Fact 2: Power-law order sizes  P(V > x) ~ x^{-1-alpha}  =>  Pareto(alpha)
-ALPHA_SIZE = 1.5
-MIN_SIZE = 10
-MAX_SIZE = 5000
+# Fact 2: Order size — mixture of round lots and odd lots
+#   Round lots (multiples of 100):  number-of-lots ~ Pareto(ALPHA_SIZE)
+#   Odd lots (1–99):                size ~ Lognormal(ODD_LOT_MU, ODD_LOT_SIGMA)
+ROUND_LOT_PROB = 0.75       # fraction of orders that are round lots
+ALPHA_SIZE = 1.2             # Pareto exponent for round-lot count (lower → heavier tail)
+MIN_LOTS = 5                 # minimum number of round lots (= 500 shares)
+MAX_LOTS = 500               # maximum number of round lots (= 50,000 shares)
+ODD_LOT_MU = 3.7             # lognormal μ  →  median ≈ 40 shares
+ODD_LOT_SIGMA = 0.6          # lognormal σ  →  most odd lots land in 20–90 range
 
 # Fact 3: Long memory in order flow via ARFIMA(0,d,0)
 FRAC_D = 0.2          # fractional differencing parameter (decay ~ k^{2d-1})
@@ -65,9 +71,9 @@ TTL_GROWTH = 0.05     # exponential growth rate per tick
 TTL_MAX = 120         # cap at 2 minutes
 
 # Action weights
-WEIGHT_BID = 0.30
-WEIGHT_ASK = 0.30
-WEIGHT_MARKET = 0.40
+WEIGHT_BID = 0.45
+WEIGHT_ASK = 0.45
+WEIGHT_MARKET = 0.10
 
 
 class FractionalOrderFlow:
@@ -126,14 +132,27 @@ def sample_delta_ticks() -> int:
 
 def sample_order_size() -> int:
     """
-    Sample order volume from Pareto distribution.
-    P(V > x) ~ x^{-alpha}  =>  V = x_min * U^{-1/alpha}
+    Sample order volume from a two-component mixture:
+
+    Round lot (prob = ROUND_LOT_PROB):
+        Draw number-of-lots ~ Pareto(ALPHA_SIZE, xmin=MIN_LOTS) via inverse CDF,
+        clamp to [MIN_LOTS, MAX_LOTS], then multiply by 100.
+        Expected lot count ≈ ALPHA_SIZE/(ALPHA_SIZE-1) * MIN_LOTS = 30 lots = 3,000 shares.
+
+    Odd lot (prob = 1 - ROUND_LOT_PROB):
+        Draw size ~ Lognormal(ODD_LOT_MU, ODD_LOT_SIGMA), clamp to [1, 99].
+        Median ≈ exp(ODD_LOT_MU) ≈ 40 shares; suppresses unrealistically tiny
+        orders (2, 3, …) while keeping some small orders in the mix.
     """
-    u = random.random()
-    if u == 0:
-        u = 1e-10
-    v = MIN_SIZE * u ** (-1.0 / ALPHA_SIZE)
-    return min(int(round(v)), MAX_SIZE)
+    if random.random() < ROUND_LOT_PROB:
+        u = random.random()
+        if u == 0:
+            u = 1e-10
+        n_lots = MIN_LOTS * u ** (-1.0 / ALPHA_SIZE)
+        return min(int(round(n_lots)), MAX_LOTS) * 100
+    else:
+        v = random.lognormvariate(ODD_LOT_MU, ODD_LOT_SIGMA)
+        return max(1, min(int(round(v)), 99))
 
 
 def order_ttl(delta_ticks: int) -> int:
@@ -223,7 +242,7 @@ class LiquidityProvider:
         bid = self._book_builder.book.get_best_bid_price()
         ask = self._book_builder.book.get_best_ask_price()
         if bid and ask:
-            raw = (bid + ask) // 2
+            raw = (bid + ask + TICK_SIZE) // 2   # ceiling → symmetric for odd-tick spreads
             return (raw // TICK_SIZE) * TICK_SIZE
         return self._bootstrap_mid
 
@@ -306,7 +325,7 @@ class LiquidityProvider:
         """Place a market order; side chosen by long-memory process."""
         sign = self.flow.next_sign()
         side = 'B' if sign == 1 else 'S'
-        size = max(MIN_SIZE, sample_order_size() // self.market_size_div)
+        size = max(1, sample_order_size() // self.market_size_div)
 
         self._send(f"market,{size},0,{side},{self.user}")
         self.trades_sent += 1
@@ -325,7 +344,9 @@ class LiquidityProvider:
         mid = self._get_mid()
         print(f"Starting liquidity provider (bootstrap mid=${mid/10000:.2f})")
         print(f"  Order interval: {self.order_interval}s")
-        print(f"  Placement exponent mu={MU}, Size exponent alpha={ALPHA_SIZE}")
+        print(f"  Placement exponent mu={MU}, Size: {ROUND_LOT_PROB:.0%} round lots "
+              f"(Pareto α={ALPHA_SIZE}), {1-ROUND_LOT_PROB:.0%} odd lots "
+              f"(LogNorm μ={ODD_LOT_MU} σ={ODD_LOT_SIGMA})")
         print(f"  ARFIMA(0,d,0) d={self.flow.d}, memory={self.flow.memory}")
         print(f"  Exponential TTL: base={TTL_BASE}s, growth={TTL_GROWTH}, "
               f"max={TTL_MAX}s")

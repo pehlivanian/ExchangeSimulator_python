@@ -396,7 +396,7 @@ class OrderClientWithFSM:
         if self._running and self._receive_thread and self._receive_thread.is_alive():
             # Wait for the pending order to be resolved by the async thread
             self._pending_event.wait(timeout=timeout)
-            return order.state != OrderState.PENDING_NEW
+            return order.state == OrderState.ACCEPTED
 
         # Fallback to sync receive if async thread isn't running
         try:
@@ -410,7 +410,7 @@ class OrderClientWithFSM:
                 if line:
                     self._process_message(line)
 
-            return order.state != OrderState.PENDING_NEW
+            return order.state == OrderState.ACCEPTED
 
         except socket.timeout:
             return False
